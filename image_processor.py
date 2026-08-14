@@ -2,7 +2,15 @@ import cv2
 import numpy as np
 
 # Read radar image
-image = cv2.imread("radar_download/radar_images/radar_1.png")
+import os
+import glob
+
+files = glob.glob("radar_download/radar_images/*.png")
+latest_image = max(files, key=os.path.getmtime)
+
+print("Using:", latest_image)
+
+image = cv2.imread(latest_image)
 
 if image is None:
     print("Image not found!")
