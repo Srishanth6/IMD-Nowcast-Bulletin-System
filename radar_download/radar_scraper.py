@@ -39,7 +39,9 @@ HEADERS = {
         "(KHTML, like Gecko) "
         "Chrome/139.0.0.0 Safari/537.36"
     ),
-    "Referer": URL
+    "Referer": URL,
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache"
 }
 
 
@@ -248,11 +250,23 @@ def download_latest_radar():
     try:
 
         # ----------------------------------------------------
+        # CACHE-BUSTING VALUE
+        # ----------------------------------------------------
+
+        cache_buster = str(
+            int(time.time())
+        )
+
+
+        # ----------------------------------------------------
         # Open IMD radar page
         # ----------------------------------------------------
 
         response = session.get(
             URL,
+            params={
+                "_": cache_buster
+            },
             timeout=30
         )
 
@@ -325,12 +339,27 @@ def download_latest_radar():
 
 
         # ----------------------------------------------------
-        # Download image
+        # DOWNLOAD IMAGE WITH CACHE BUSTER
         # ----------------------------------------------------
 
         image_response = session.get(
             image_url,
+            params={
+                "_": cache_buster
+            },
+            headers={
+                "User-Agent": HEADERS["User-Agent"],
+                "Referer": URL,
+                "Cache-Control": "no-cache",
+                "Pragma": "no-cache"
+            },
             timeout=30
+        )
+
+
+        print(
+            "Image status:",
+            image_response.status_code
         )
 
 
@@ -342,6 +371,10 @@ def download_latest_radar():
 
             return
 
+
+        # ----------------------------------------------------
+        # Get image data
+        # ----------------------------------------------------
 
         image_data = (
             image_response.content
@@ -355,6 +388,24 @@ def download_latest_radar():
             )
 
             return
+
+
+        # ----------------------------------------------------
+        # Check content type
+        # ----------------------------------------------------
+
+        content_type = (
+            image_response.headers.get(
+                "Content-Type",
+                ""
+            )
+        )
+
+
+        print(
+            "Content type:",
+            content_type
+        )
 
 
         # ----------------------------------------------------
@@ -393,7 +444,7 @@ def download_latest_radar():
 
 
         # ----------------------------------------------------
-        # Save ONLY latest_radar.png
+        # Save latest radar image
         # ----------------------------------------------------
 
         with open(
@@ -426,7 +477,7 @@ def download_latest_radar():
         )
 
         print(
-            "Updated:",
+            "Downloaded:",
             datetime.now().strftime(
                 "%d-%m-%Y %H:%M:%S"
             )
