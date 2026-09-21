@@ -12,7 +12,7 @@ from integrate_bulletin import IMD_HTML_PATH, read_bulletin_metadata
 
 
 ROOT = Path(__file__).resolve().parent
-IMAGE_PATH = ROOT / "integrated_bulletin.png"
+IMAGE_PATH = ROOT / "final_bulletin.png"
 OUTPUT_PATH = ROOT / "IMD_Nowcast_Bulletin.docx"
 
 NAVY = "0C2F52"
