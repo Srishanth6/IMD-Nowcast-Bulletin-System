@@ -1,3 +1,23 @@
 # Server Integration
 
-This folder contains the Telangana warning map and IMD server integration work.
+The live webpage is Apache on Ubuntu:
+
+  http://117.203.102.123:8088/tlng/wx/dist_nowcast.php
+
+Download Nowcast Bulletin is:
+
+  dist_nowcast3.php  →  attachment filename telangana_nowcast.docx
+
+That PHP script is on the IMD Apache host under /var/www/html/tlng/wx/.
+This Python project generates IMD_Nowcast_Bulletin.docx in the repo root.
+
+py generate_bulletin.py copies the generated file to:
+
+  IMD_Nowcast_Bulletin.docx
+  telangana_nowcast.docx
+
+and copies dist_nowcast3.php into /var/www/html/tlng/wx when that folder
+is writable (when the generator runs on the IMD Apache server), or into
+IMD_WX_DIR if that environment variable is set.
+
+The map page itself is not modified.

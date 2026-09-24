@@ -12,6 +12,7 @@ import html as html_lib
 import io
 import os
 import re
+import shutil
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -43,6 +44,10 @@ PAGE2_IMPACTS_PATH = ROOT / "assets" / "expected_impacts_moderate.jpg"
 PAGE3_IMPACTS_PATH = ROOT / "assets" / "expected_impacts_heavy_rain.jpg"
 PAGE4_IMPACTS_PATH = ROOT / "assets" / "expected_impacts_very_severe.jpg"
 OUTPUT_PATH = ROOT / "IMD_Nowcast_Bulletin.docx"
+SERVED_BULLETIN_NAME = "telangana_nowcast.docx"
+DOWNLOAD_PHP_PATH = ROOT / "dist_nowcast3.php"
+DEFAULT_WX_DIR = Path("/var/www/html/tlng/wx")
+DOWNLOAD_BULLETIN_URL = urljoin(IMD_NOWCAST_URL, "dist_nowcast3.php")
 
 try:
     IST = ZoneInfo("Asia/Kolkata")
@@ -474,6 +479,75 @@ def build_document(radar_path: Path, map_path: Path, warning_data: dict, issued:
     return document
 
 
+def nowcast_wx_directories() -> list[Path]:
+    """Directories that Apache/PHP can use for Download Nowcast Bulletin."""
+    directories: list[Path] = []
+    seen: set[Path] = set()
+    env_dir = os.environ.get("IMD_WX_DIR", "").strip()
+    candidates = []
+    if env_dir:
+        candidates.append(Path(env_dir))
+    candidates.append(DEFAULT_WX_DIR)
+    candidates.append(ROOT)
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        directories.append(candidate)
+    return directories
+
+
+def _copy_if_needed(source: Path, destination: Path) -> Path | None:
+    if not source.is_file():
+        return None
+    if destination.exists() and destination.resolve() == source.resolve():
+        return destination
+    try:
+        shutil.copy2(source, destination)
+    except OSError:
+        return None
+    return destination
+
+
+def publish_generated_bulletin(docx_path: Path) -> list[Path]:
+    """Copy the generated bulletin (and download PHP) into the IMD wx folder."""
+    published: list[Path] = []
+    seen: set[Path] = set()
+    for directory in nowcast_wx_directories():
+        if not directory.is_dir() or not os.access(directory, os.W_OK):
+            continue
+        for name in (OUTPUT_PATH.name, SERVED_BULLETIN_NAME):
+            copied = _copy_if_needed(docx_path, directory / name)
+            if copied is not None:
+                key = copied.resolve()
+                if key not in seen:
+                    seen.add(key)
+                    published.append(copied)
+        php_copy = _copy_if_needed(DOWNLOAD_PHP_PATH, directory / DOWNLOAD_PHP_PATH.name)
+        if php_copy is not None:
+            key = php_copy.resolve()
+            if key not in seen:
+                seen.add(key)
+                published.append(php_copy)
+    return published
+
+
+def live_download_matches(docx_path: Path) -> bool:
+    """True when the IP Download Nowcast Bulletin link returns this generated file."""
+    try:
+        response = requests.get(
+            DOWNLOAD_BULLETIN_URL,
+            timeout=60,
+            headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        )
+        response.raise_for_status()
+    except Exception as error:
+        print(f"WARNING: could not check Download Nowcast Bulletin: {error}")
+        return False
+    return response.content == docx_path.read_bytes()
+
+
 def main():
     print("=" * 60)
     print(" IMD NOWCAST BULLETIN")
@@ -527,12 +601,32 @@ def main():
     try:
         document = build_document(radar_path, map_path, warning_data, issued, valid)
         document.save(OUTPUT_PATH)
+        published = publish_generated_bulletin(OUTPUT_PATH)
     except Exception as error:
         print(f"ERROR: could not generate the bulletin: {error}")
         return 1
 
     print("Bulletin generated successfully!")
     print(f"Saved: {OUTPUT_PATH.name}")
+    if published:
+        print("Published for Download Nowcast Bulletin:")
+        for path in published:
+            print(f"  {path.as_posix()}")
+        print(f"Download URL: {DOWNLOAD_BULLETIN_URL}")
+        if live_download_matches(OUTPUT_PATH):
+            print("Download Nowcast Bulletin is serving this generated bulletin.")
+        else:
+            print(
+                "WARNING: the IP download link is still serving the previous "
+                "server-generated bulletin. Run this script on the IMD Apache "
+                "host (or set IMD_WX_DIR to /var/www/html/tlng/wx) so "
+                "dist_nowcast3.php and IMD_Nowcast_Bulletin.docx land in that folder."
+            )
+    else:
+        print(
+            "WARNING: could not copy the bulletin into the IMD wx folder. "
+            "Set IMD_WX_DIR to /var/www/html/tlng/wx on the Apache server."
+        )
     return 0
 
 
