@@ -1,7 +1,10 @@
 import os
+import sys
 import time
 import hashlib
 import requests
+
+sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from datetime import datetime, timedelta
@@ -18,7 +21,7 @@ URL = "https://mausam.imd.gov.in/hyderabad/index_radar.php?id=Hyderabad"
 # SAVE LOCATION
 # ============================================================
 
-SAVE_FOLDER = "radar_download/radar_images"
+SAVE_FOLDER = os.path.join(os.path.dirname(os.path.abspath(__file__)), "radar_images")
 
 os.makedirs(SAVE_FOLDER, exist_ok=True)
 
@@ -440,7 +443,7 @@ def download_latest_radar():
                 "No update required."
             )
 
-            return
+            return LATEST_FILE
 
 
         # ----------------------------------------------------
@@ -484,6 +487,8 @@ def download_latest_radar():
         )
 
         print("=" * 60)
+
+        return LATEST_FILE
 
 
     except requests.exceptions.RequestException as e:
@@ -587,29 +592,31 @@ def wait_until_next_schedule():
 # PROGRAM START
 # ============================================================
 
-print("=" * 60)
+if __name__ == "__main__":
 
-print(
-    " IMD RADAR AUTO DOWNLOADER "
-)
+    print("=" * 60)
 
-print(
-    " Product: MAX (Z)"
-)
+    print(
+        " IMD RADAR AUTO DOWNLOADER "
+    )
 
-print(
-    " Output: latest_radar.png"
-)
+    print(
+        " Product: MAX (Z)"
+    )
 
-print("=" * 60)
+    print(
+        " Output: latest_radar.png"
+    )
+
+    print("=" * 60)
 
 
-# ============================================================
-# MAIN LOOP
-# ============================================================
+    # ============================================================
+    # MAIN LOOP
+    # ============================================================
 
-while True:
+    while True:
 
-    download_latest_radar()
+        download_latest_radar()
 
-    wait_until_next_schedule()
+        wait_until_next_schedule()

@@ -64,12 +64,21 @@ def render_svg(svg):
         subprocess.run(command, check=True, timeout=60, capture_output=True)
 
 
-def main():
-    response = requests.get(URL, timeout=30)
-    response.raise_for_status()
-    svg = extract_svg(response.text)
+def save_warning_map(html: str) -> Path:
+    svg = extract_svg(html)
     SVG_PATH.write_text(svg, encoding="utf-8")
     render_svg(svg)
+    return PNG_PATH
+
+
+def main():
+    response = requests.get(
+        URL,
+        timeout=30,
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+    )
+    response.raise_for_status()
+    save_warning_map(response.text)
     print(f"Saved {SVG_PATH.name} and {PNG_PATH.name}")
 
 

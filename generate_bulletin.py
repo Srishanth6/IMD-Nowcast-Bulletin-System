@@ -67,9 +67,23 @@ class BulletinInputError(FileNotFoundError):
     """Raised when a required bulletin input image is missing."""
 
 
-def issue_times():
-    issued = datetime.now(IST).replace(microsecond=0)
-    return issued, issued + NOWCAST_VALIDITY
+def datetimes_from_imd(page_fields: dict):
+    """Use the issue time published on the latest IMD page, not the local clock."""
+    date_db = page_fields.get("date_db")
+    toi = page_fields.get("time_toi_db")
+    valid_text = page_fields.get("valid_upto_db")
+    if not date_db or not toi:
+        raise BulletinInputError(
+            "The latest IMD page did not include Date (DB) and Time TOI (DB)."
+        )
+    issued = datetime.strptime(f"{date_db} {toi}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+    if valid_text:
+        valid = datetime.strptime(f"{date_db} {valid_text}", "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+        if valid <= issued:
+            valid += timedelta(days=1)
+    else:
+        valid = issued + NOWCAST_VALIDITY
+    return issued, valid
 
 
 def _has_telugu(text: str) -> bool:
@@ -154,12 +168,21 @@ def parse_official_bulletin_docx(docx_bytes: bytes) -> dict:
     return sections
 
 
-def load_imd_warning_content() -> dict:
-    print("Fetching IMD nowcast page:")
-    print(f"  {IMD_NOWCAST_URL}")
-    page = requests.get(IMD_NOWCAST_URL, timeout=30)
+def fetch_nowcast_page() -> str:
+    page = requests.get(
+        IMD_NOWCAST_URL,
+        params={"_": str(int(datetime.now(IST).timestamp()))},
+        headers={"Cache-Control": "no-cache", "Pragma": "no-cache"},
+        timeout=30,
+    )
     page.raise_for_status()
-    page_fields = parse_nowcast_page(page.text)
+    html_path = ROOT / "imd_response.html"
+    html_path.write_text(page.text, encoding="utf-8")
+    return page.text
+
+
+def load_imd_warning_content(page_html: str) -> dict:
+    page_fields = parse_nowcast_page(page_html)
 
     print("Fields available on dist_nowcast.php:")
     print(f"  Date (DB): {page_fields['date_db']}")
@@ -328,10 +351,9 @@ def add_warning_block(document, title: str, fill: str, english: str, telugu: str
         set_run_font(telugu_run, name="Nirmala UI", size=11)
 
 
-def build_document(radar_path: Path, map_path: Path, warning_data: dict):
-    issued, valid = issue_times()
-    print(f"TIME OF ISSUE: {issued.isoformat()}")
-    print(f"Valid upto:     {valid.isoformat()}")
+def build_document(radar_path: Path, map_path: Path, warning_data: dict, issued: datetime, valid: datetime):
+    print(format_issue_line(issued))
+    print(format_valid_line(valid))
 
     document = Document()
     section = document.sections[0]
@@ -453,32 +475,63 @@ def build_document(radar_path: Path, map_path: Path, warning_data: dict):
 
 def main():
     print("=" * 60)
-    print(" IMD NOWCAST BULLETIN — PAGE 1 INTEGRATION")
+    print(" IMD NOWCAST BULLETIN")
     print("=" * 60)
+    print("Fetching latest IMD data...")
 
     try:
-        radar_path = require_input(RADAR_PATH, "radar image")
-        map_path = require_input(WARNING_MAP_PATH, "warning map")
-    except BulletinInputError as error:
-        print(f"ERROR: {error}")
-        return 1
-
-    if WARNING_SVG_PATH.is_file():
-        print(f"Loaded warning SVG: {WARNING_SVG_PATH.relative_to(ROOT).as_posix()}")
-
-    try:
-        warning_data = load_imd_warning_content()
+        page_html = fetch_nowcast_page()
     except Exception as error:
-        print(f"ERROR: could not load IMD warning data: {error}")
+        print(f"ERROR: could not fetch the latest IMD nowcast page: {error}")
         return 1
 
-    document = build_document(radar_path, map_path, warning_data)
-    document.save(OUTPUT_PATH)
+    try:
+        from radar_download.radar_scraper import download_latest_radar
 
-    print("=" * 60)
-    print("Bulletin generated successfully.")
-    print(f"Saved: {OUTPUT_PATH.relative_to(ROOT).as_posix()}")
-    print("=" * 60)
+        radar_file = download_latest_radar()
+    except Exception as error:
+        print(f"ERROR: could not download the latest radar image: {error}")
+        return 1
+    if not radar_file or not Path(radar_file).is_file():
+        print("ERROR: the latest radar image was not downloaded.")
+        return 1
+    radar_path = Path(radar_file)
+    print(f"Latest radar found: {radar_path}")
+
+    try:
+        from download_warning_map import save_warning_map
+
+        map_path = save_warning_map(page_html)
+    except Exception as error:
+        print(f"ERROR: could not download the latest warning map: {error}")
+        return 1
+    print(f"Latest warning map found: {map_path}")
+
+    try:
+        warning_data = load_imd_warning_content(page_html)
+        issued, valid = datetimes_from_imd(warning_data["page_fields"])
+    except Exception as error:
+        print(f"ERROR: could not extract the IMD issue time: {error}")
+        return 1
+
+    print(
+        "Issue time extracted: "
+        f"{issued.strftime('%Y-%m-%d')} ({issued.strftime('%H:%M:%S')} Hrs IST)"
+    )
+    print("Generating final bulletin...")
+
+    try:
+        from integrate_bulletin import main as build_integrated_image
+
+        build_integrated_image()
+        document = build_document(radar_path, map_path, warning_data, issued, valid)
+        document.save(OUTPUT_PATH)
+    except Exception as error:
+        print(f"ERROR: could not generate the bulletin: {error}")
+        return 1
+
+    print("Bulletin generated successfully!")
+    print(f"Saved: {OUTPUT_PATH.name}")
     return 0
 
 

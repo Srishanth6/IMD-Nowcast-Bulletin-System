@@ -128,8 +128,7 @@ def main():
 
     print("Radar found:", radar.size)
     print("Warning map found:", warning_map.size)
-    print("Bulletin generated successfully!")
-    print("Saved: final_bulletin.png")
+    print("Integrated image saved: final_bulletin.png")
     print("Final size:", canvas.size)
 
 
