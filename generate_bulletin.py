@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import html as html_lib
 import io
+import os
 import re
 import sys
 import zipfile
@@ -477,6 +478,7 @@ def main():
     print("=" * 60)
     print(" IMD NOWCAST BULLETIN")
     print("=" * 60)
+    os.chdir(ROOT)
     print("Fetching latest IMD data...")
 
     try:
@@ -488,6 +490,7 @@ def main():
     try:
         from radar_download.radar_scraper import download_latest_radar
 
+        print("Downloading latest radar image...")
         radar_file = download_latest_radar()
     except Exception as error:
         print(f"ERROR: could not download the latest radar image: {error}")
@@ -496,16 +499,17 @@ def main():
         print("ERROR: the latest radar image was not downloaded.")
         return 1
     radar_path = Path(radar_file)
-    print(f"Latest radar found: {radar_path}")
+    print(f"Latest radar saved: {radar_path.as_posix()}")
 
     try:
         from download_warning_map import save_warning_map
 
+        print("Downloading latest warning map...")
         map_path = save_warning_map(page_html)
     except Exception as error:
         print(f"ERROR: could not download the latest warning map: {error}")
         return 1
-    print(f"Latest warning map found: {map_path}")
+    print(f"Latest warning map saved: {Path(map_path).as_posix()}")
 
     try:
         warning_data = load_imd_warning_content(page_html)
@@ -521,9 +525,6 @@ def main():
     print("Generating final bulletin...")
 
     try:
-        from integrate_bulletin import main as build_integrated_image
-
-        build_integrated_image()
         document = build_document(radar_path, map_path, warning_data, issued, valid)
         document.save(OUTPUT_PATH)
     except Exception as error:
