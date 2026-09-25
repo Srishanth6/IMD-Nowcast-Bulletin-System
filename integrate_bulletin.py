@@ -50,6 +50,15 @@ def read_bulletin_metadata():
     return metadata
 
 
+def apply_bulletin_times(metadata, issued=None, valid=None):
+    if issued is not None:
+        metadata["date"] = issued.strftime("%Y-%m-%d")
+        metadata["toi"] = issued.strftime("%H:%M:%S")
+    if valid is not None:
+        metadata["valid"] = valid.strftime("%H:%M:%S")
+    return metadata
+
+
 def draw_centered(draw, box, text, font, fill):
     left, top, right, bottom = box
     bounds = draw.textbbox((0, 0), text, font=font)
@@ -74,7 +83,7 @@ def place_image(canvas, image, box):
     canvas.alpha_composite(contained, position)
 
 
-def main():
+def main(issued=None, valid=None):
     print("Checking files...")
 
     if not RADAR_PATH.exists():
@@ -84,7 +93,7 @@ def main():
 
     radar = Image.open(RADAR_PATH).convert("RGBA")
     warning_map = Image.open(MAP_PATH).convert("RGBA")
-    metadata = read_bulletin_metadata()
+    metadata = apply_bulletin_times(read_bulletin_metadata(), issued, valid)
 
     canvas = Image.new("RGBA", CANVAS_SIZE, WHITE)
     draw = ImageDraw.Draw(canvas)

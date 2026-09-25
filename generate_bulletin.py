@@ -1,9 +1,9 @@
 """
-IMD Nowcast Bulletin — Page 1 integration.
+IMD Nowcast Bulletin — single-page IMD format.
 
 Combines Person 1 radar and Person 2 warning-map outputs into a Word
-bulletin that follows the official Telangana nowcast Page 1 structure.
-Warning text is parsed from the live IMD server, not from hard-coded lists.
+bulletin that follows the required one-page Telangana nowcast layout.
+Times come from the live IMD nowcast page, not hard-coded values.
 """
 
 from __future__ import annotations
@@ -32,6 +32,8 @@ from docx.shared import Cm, Inches, Pt, RGBColor
 from PIL import Image
 
 from download_warning_map import URL as IMD_NOWCAST_URL, extract_svg
+from integrate_bulletin import OUTPUT_PATH as COMPOSITE_PATH
+from integrate_bulletin import main as build_composite_image
 
 
 ROOT = Path(__file__).resolve().parent
@@ -58,6 +60,11 @@ NOWCAST_VALIDITY = timedelta(hours=3)
 ORANGE_FILL = "FFA500"
 YELLOW_FILL = "FFFF00"
 NAVY = RGBColor(0x0C, 0x2F, 0x52)
+BLUE = RGBColor(0x20, 0x5B, 0x91)
+INK = RGBColor(0x24, 0x34, 0x45)
+GOLD = RGBColor(0xE2, 0xA2, 0x2C)
+PALE_FILL = "EBF3FA"
+BORDER_BLUE = "205B91"
 W_NS = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
 
 LEVELS = (
@@ -231,7 +238,15 @@ def format_valid_line(valid: datetime) -> str:
     return f"Valid upto: ({valid.strftime('%H:%M:%S')} Hrs IST)"
 
 
-def set_run_font(run, name="Times New Roman", size=11, bold=False, color=None):
+def format_bottom_timestamp(issued: datetime, valid: datetime) -> str:
+    return (
+        f"Date: {issued.strftime('%Y-%m-%d')}  |  "
+        f"Time of Issue: {issued.strftime('%H:%M:%S')}  |  "
+        f"Valid Up To: {valid.strftime('%H:%M:%S')}"
+    )
+
+
+def set_run_font(run, name="Arial", size=11, bold=False, color=None):
     run.font.name = name
     run.font.size = Pt(size)
     run.font.bold = bold
@@ -246,42 +261,41 @@ def set_run_font(run, name="Times New Roman", size=11, bold=False, color=None):
         run.font.color.rgb = color
 
 
-def shade_run(run, fill: str):
-    rpr = run._element.get_or_add_rPr()
+def set_cell_width(cell, width):
+    cell.width = width
+
+
+def shade_cell(cell, fill: str):
+    tc_pr = cell._tc.get_or_add_tcPr()
     shading = OxmlElement("w:shd")
     shading.set(qn("w:val"), "clear")
+    shading.set(qn("w:color"), "auto")
     shading.set(qn("w:fill"), fill)
-    rpr.append(shading)
+    tc_pr.append(shading)
 
 
-def set_cell_width(cell, width_emu: int):
-    cell.width = width_emu
-
-
-def disable_table_borders(table):
-    tbl = table._tbl
-    tbl_pr = tbl.tblPr
-    borders = OxmlElement("w:tblBorders")
-    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+def set_cell_borders(cell, color=BORDER_BLUE, size="8"):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    borders = OxmlElement("w:tcBorders")
+    for edge in ("top", "left", "bottom", "right"):
         element = OxmlElement(f"w:{edge}")
-        element.set(qn("w:val"), "nil")
-        element.set(qn("w:sz"), "0")
+        element.set(qn("w:val"), "single")
+        element.set(qn("w:sz"), size)
         element.set(qn("w:space"), "0")
-        element.set(qn("w:color"), "auto")
+        element.set(qn("w:color"), color)
         borders.append(element)
-    tbl_pr.append(borders)
+    tc_pr.append(borders)
 
 
-def add_bottom_border(paragraph):
-    p_pr = paragraph._p.get_or_add_pPr()
-    p_bdr = OxmlElement("w:pBdr")
-    bottom = OxmlElement("w:bottom")
-    bottom.set(qn("w:val"), "single")
-    bottom.set(qn("w:sz"), "12")
-    bottom.set(qn("w:space"), "4")
-    bottom.set(qn("w:color"), "000000")
-    p_bdr.append(bottom)
-    p_pr.append(p_bdr)
+def set_cell_margins(cell, top=100, bottom=100, start=140, end=140):
+    tc_pr = cell._tc.get_or_add_tcPr()
+    margins = OxmlElement("w:tcMar")
+    for name, value in (("top", top), ("bottom", bottom), ("start", start), ("end", end)):
+        node = OxmlElement(f"w:{name}")
+        node.set(qn("w:w"), str(value))
+        node.set(qn("w:type"), "dxa")
+        margins.append(node)
+    tc_pr.append(margins)
 
 
 def add_paragraph(document, text="", *, align="left", space_after=4, space_before=0):
@@ -294,7 +308,7 @@ def add_paragraph(document, text="", *, align="left", space_after=4, space_befor
     paragraph.alignment = alignment
     paragraph.paragraph_format.space_before = Pt(space_before)
     paragraph.paragraph_format.space_after = Pt(space_after)
-    paragraph.paragraph_format.line_spacing = 1.08
+    paragraph.paragraph_format.line_spacing = 1.0
     if text:
         run = paragraph.add_run(text)
         set_run_font(run)
@@ -323,159 +337,92 @@ def require_input(path: Path, label: str):
     return path
 
 
-def add_page_break(document):
-    paragraph = document.add_paragraph()
-    paragraph.paragraph_format.space_before = Pt(0)
+def add_page_header(section):
+    header = section.header
+    paragraph = header.paragraphs[0]
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
     paragraph.paragraph_format.space_after = Pt(0)
-    paragraph.add_run().add_break(WD_BREAK.PAGE)
+    run = paragraph.add_run("INDIA METEOROLOGICAL DEPARTMENT")
+    set_run_font(run, size=10, bold=True, color=NAVY)
 
 
-def add_impact_page(document, image_path: Path, label: str):
-    if not image_path.is_file():
-        print(f"WARNING: {label} reference page not found: {image_path.relative_to(ROOT).as_posix()}")
-        return
-    paragraph = add_paragraph(document, align="center", space_before=6, space_after=6)
-    width, height = picture_size(image_path, 7.1, 9.4)
-    paragraph.add_run().add_picture(str(image_path), width=width, height=height)
-    print(f"Loaded {label}: {image_path.relative_to(ROOT).as_posix()}")
-
-
-def add_warning_block(document, title: str, fill: str, english: str, telugu: str = ""):
-    heading = add_paragraph(document, space_after=2, space_before=4)
-    run = heading.add_run(title)
-    set_run_font(run, size=12, bold=True)
-    shade_run(run, fill)
-
-    if english:
-        english_para = add_paragraph(document, space_after=2)
-        english_run = english_para.add_run(english)
-        set_run_font(english_run, size=11)
-
-    if telugu:
-        telugu_para = add_paragraph(document, space_after=6)
-        telugu_run = telugu_para.add_run(telugu)
-        set_run_font(telugu_run, name="Nirmala UI", size=11)
+def add_datetime_table(document, issued: datetime, valid: datetime):
+    table = document.add_table(rows=1, cols=3)
+    table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    table.autofit = False
+    cell_width = Inches(2.366)
+    values = (
+        ("BULLETIN DATE", issued.strftime("%Y-%m-%d")),
+        ("TIME OF ISSUE", issued.strftime("%H:%M:%S")),
+        ("VALID UP TO", valid.strftime("%H:%M:%S")),
+    )
+    for cell, (label, value) in zip(table.rows[0].cells, values):
+        set_cell_width(cell, cell_width)
+        shade_cell(cell, PALE_FILL)
+        set_cell_borders(cell)
+        set_cell_margins(cell)
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        cell.text = ""
+        paragraph = cell.paragraphs[0]
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph.paragraph_format.space_after = Pt(2)
+        label_run = paragraph.add_run(label)
+        set_run_font(label_run, size=8.5, bold=True, color=BLUE)
+        label_run.add_break()
+        value_run = paragraph.add_run(value)
+        set_run_font(value_run, size=11, bold=True, color=INK)
+    return table
 
 
 def build_document(radar_path: Path, map_path: Path, warning_data: dict, issued: datetime, valid: datetime):
     print(format_issue_line(issued))
     print(format_valid_line(valid))
+    print(format_bottom_timestamp(issued, valid))
+    require_input(radar_path, "Hyderabad radar image")
+    require_input(map_path, "Telangana warning map")
+
+    print("Building IMD-style bulletin visual...")
+    build_composite_image(issued=issued, valid=valid)
+    composite_path = require_input(COMPOSITE_PATH, "integrated bulletin visual")
 
     document = Document()
     section = document.sections[0]
-    section.page_width = Cm(21.0)
-    section.page_height = Cm(29.7)
-    section.top_margin = Cm(1.27)
-    section.bottom_margin = Cm(1.27)
-    section.left_margin = Cm(1.27)
-    section.right_margin = Cm(1.27)
+    section.page_width = Inches(8.5)
+    section.page_height = Inches(11)
+    section.top_margin = Inches(0.55)
+    section.bottom_margin = Inches(0.55)
+    section.left_margin = Inches(0.7)
+    section.right_margin = Inches(0.7)
+    section.header_distance = Inches(0.25)
+    add_page_header(section)
 
-    header = add_paragraph(document, align="center", space_after=0)
-    if HEADER_PATH.is_file():
-        header_width, header_height = picture_size(HEADER_PATH, 7.1, 1.35)
-        header.add_run().add_picture(
-            str(HEADER_PATH),
-            width=header_width,
-            height=header_height,
-        )
-        print(f"Loaded IMD header: {HEADER_PATH.relative_to(ROOT).as_posix()}")
-    else:
-        run = header.add_run(
-            "India Meteorological Department  |  Meteorological Centre, Hyderabad"
-        )
-        set_run_font(run, size=12, bold=True, color=NAVY)
+    title = add_paragraph(document, align="center", space_before=6, space_after=2)
+    title_run = title.add_run("NOWCAST BULLETIN")
+    set_run_font(title_run, size=24, bold=True, color=NAVY)
 
-    title = add_paragraph(document, align="center", space_before=4, space_after=6)
-    title_run = title.add_run("District level Nowcast of Telangana")
-    set_run_font(title_run, size=16, bold=True)
-    add_bottom_border(title)
+    state = add_paragraph(document, align="center", space_before=0, space_after=12)
+    state_run = state.add_run("TELANGANA")
+    set_run_font(state_run, size=15, bold=True, color=BLUE)
 
-    usable_width = section.page_width - section.left_margin - section.right_margin
-    half = usable_width // 2
-    time_table = document.add_table(rows=1, cols=2)
-    time_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    disable_table_borders(time_table)
-    left_cell, right_cell = time_table.rows[0].cells
-    set_cell_width(left_cell, int(half))
-    set_cell_width(right_cell, int(half))
+    add_datetime_table(document, issued, valid)
+    add_paragraph(document, space_after=0)
 
-    left_cell.text = ""
-    left_para = left_cell.paragraphs[0]
-    left_run = left_para.add_run(format_issue_line(issued))
-    set_run_font(left_run, size=11, bold=True)
+    visual = add_paragraph(document, align="center", space_before=4, space_after=10)
+    width, height = picture_size(composite_path, 7.1, 4.9)
+    visual.add_run().add_picture(str(composite_path), width=width, height=height)
 
-    right_cell.text = ""
-    right_para = right_cell.paragraphs[0]
-    right_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
-    right_run = right_para.add_run(format_valid_line(valid))
-    set_run_font(right_run, size=11, bold=True)
+    separator = add_paragraph(document, align="center", space_before=0, space_after=5)
+    sep_run = separator.add_run("_" * 64)
+    set_run_font(sep_run, size=7, color=GOLD)
 
-    add_paragraph(document, space_after=2)
+    source = add_paragraph(document, align="center", space_after=0)
+    source_run = source.add_run(
+        "Source: India Meteorological Department | Telangana nowcast products"
+    )
+    set_run_font(source_run, size=8.5, color=INK)
 
-    warning_sections = warning_data.get("warning_sections") or {}
     fill_counts = warning_data.get("page_fields", {}).get("map_fill_counts") or Counter()
-    for key, title_text, fill in LEVELS:
-        section = warning_sections.get(key) or {}
-        english = (section.get("english") or "").strip()
-        telugu = (section.get("telugu") or "").strip()
-        has_map_color = fill_counts.get(key, 0) > 0
-        if not english and not telugu and not has_map_color and key not in ALWAYS_SHOW_LEVELS:
-            continue
-        add_warning_block(document, title_text, fill, english, telugu)
-        if english:
-            print(f"{title_text}: {english}")
-        elif has_map_color:
-            print(
-                f"{title_text}: map has {fill_counts[key]} {key} polygon(s); "
-                "no English/Telugu sentence was present in the IMD text source."
-            )
-        else:
-            print(f"{title_text}: no IMD warning text for this colour")
-
-    image_table = document.add_table(rows=1, cols=2)
-    image_table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    disable_table_borders(image_table)
-    radar_cell, map_cell = image_table.rows[0].cells
-    set_cell_width(radar_cell, int(half))
-    set_cell_width(map_cell, int(half))
-    radar_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
-    map_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
-
-    radar_cell.text = ""
-    radar_para = radar_cell.paragraphs[0]
-    radar_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    radar_w, radar_h = picture_size(radar_path, 3.35, 2.85)
-    radar_para.add_run().add_picture(str(radar_path), width=radar_w, height=radar_h)
-
-    map_cell.text = ""
-    map_para = map_cell.paragraphs[0]
-    map_para.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    map_w, map_h = picture_size(map_path, 3.35, 3.35)
-    map_para.add_run().add_picture(str(map_path), width=map_w, height=map_h)
-
-    add_page_break(document)
-    add_impact_page(
-        document,
-        PAGE2_IMPACTS_PATH,
-        "Page 2 Expected Impacts (Moderate Thunderstorm/Lightning)",
-    )
-    add_page_break(document)
-    add_impact_page(
-        document,
-        PAGE3_IMPACTS_PATH,
-        "Page 3 Expected Impacts (Heavy Rain)",
-    )
-    add_page_break(document)
-    add_impact_page(
-        document,
-        PAGE4_IMPACTS_PATH,
-        "Page 4 Expected Impacts (Very Severe Thunderstorm/Squall)",
-    )
-
-    duty = add_paragraph(document, align="right", space_before=18, space_after=0)
-    duty_run = duty.add_run("డ్యూటీ అధికారి / ड्यूटी अधिकारी / Duty Officer")
-    set_run_font(duty_run, name="Nirmala UI", size=12)
-
+    print(f"Map polygon fills used in the visual: {dict(fill_counts)}")
     return document
 
 
