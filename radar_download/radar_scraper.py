@@ -233,6 +233,79 @@ def find_max_z_image(soup):
 
 
 # ============================================================
+# VALIDATE AND CONVERT RADAR BYTES
+# ============================================================
+
+RADAR_RETRIES = 4
+RADAR_RETRY_DELAY_SECONDS = 2
+MIN_RADAR_BYTES = 64
+
+GIF_HEADERS = (b"GIF87a", b"GIF89a")
+PNG_HEADER = b"\x89PNG\r\n\x1a\n"
+JPEG_HEADER = b"\xff\xd8\xff"
+
+
+def previous_radar_is_valid():
+    if not os.path.exists(LATEST_FILE):
+        return False
+    try:
+        if os.path.getsize(LATEST_FILE) < MIN_RADAR_BYTES:
+            return False
+        from PIL import Image
+        with Image.open(LATEST_FILE) as image:
+            image.load()
+            return image.size[0] >= 8 and image.size[1] >= 8
+    except Exception:
+        return False
+
+
+def looks_like_image_bytes(data):
+    if not data or len(data) < MIN_RADAR_BYTES:
+        return False
+    return data.startswith(GIF_HEADERS + (PNG_HEADER, JPEG_HEADER))
+
+
+def radar_bytes_to_png(data):
+    from io import BytesIO
+    from PIL import Image, ImageFile
+
+    ImageFile.LOAD_TRUNCATED_IMAGES = True
+    with Image.open(BytesIO(data)) as image:
+        image.load()
+        if image.size[0] < 8 or image.size[1] < 8:
+            raise ValueError("radar image is too small")
+        if image.mode in ("P", "RGBA", "LA"):
+            converted = image.convert("RGBA")
+        else:
+            converted = image.convert("RGB")
+        output = BytesIO()
+        converted.save(output, format="PNG")
+        png_data = output.getvalue()
+    if not png_data.startswith(PNG_HEADER):
+        raise ValueError("PNG conversion did not produce a PNG file")
+    return png_data
+
+
+def fetch_max_z_image(image_url, attempt):
+    headers = {
+        "User-Agent": HEADERS["User-Agent"],
+        "Referer": URL,
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Accept": "image/gif,image/png,image/jpeg,image/*,*/*;q=0.8",
+    }
+    params = None
+    if attempt > 1:
+        params = {"_": str(int(time.time() * 1000))}
+    return session.get(
+        image_url,
+        params=params,
+        headers=headers,
+        timeout=30,
+    )
+
+
+# ============================================================
 # DOWNLOAD LATEST MAX (Z) RADAR
 # ============================================================
 
@@ -342,73 +415,53 @@ def download_latest_radar():
 
 
         # ----------------------------------------------------
-        # DOWNLOAD IMAGE WITH CACHE BUSTER
+        # DOWNLOAD IMAGE (exact URL first, then retries)
         # ----------------------------------------------------
 
-        image_response = session.get(
-            image_url,
-            params={
-                "_": cache_buster
-            },
-            headers={
-                "User-Agent": HEADERS["User-Agent"],
-                "Referer": URL,
-                "Cache-Control": "no-cache",
-                "Pragma": "no-cache"
-            },
-            timeout=30
-        )
+        png_data = None
+        validation_succeeded = False
 
+        for attempt in range(1, RADAR_RETRIES + 1):
+            print(f"Radar download attempt {attempt}/{RADAR_RETRIES}")
+            image_response = fetch_max_z_image(image_url, attempt)
+            content_type = image_response.headers.get("Content-Type", "")
+            image_data = image_response.content or b""
+            print("HTTP status:", image_response.status_code)
+            print("response byte count:", len(image_data))
+            print("content type:", content_type or "(missing)")
 
-        print(
-            "Image status:",
-            image_response.status_code
-        )
+            if image_response.status_code != 200:
+                print("Image validation succeeded: no")
+                time.sleep(RADAR_RETRY_DELAY_SECONDS)
+                continue
 
+            if not looks_like_image_bytes(image_data):
+                print("❌ Empty or invalid radar bytes received.")
+                print("Image validation succeeded: no")
+                time.sleep(RADAR_RETRY_DELAY_SECONDS)
+                continue
 
-        if image_response.status_code != 200:
+            try:
+                png_data = radar_bytes_to_png(image_data)
+                validation_succeeded = True
+                print("Image validation succeeded: yes")
+                break
+            except Exception as error:
+                print(f"❌ Radar bytes could not be opened as an image: {error}")
+                print("Image validation succeeded: no")
+                png_data = None
+                time.sleep(RADAR_RETRY_DELAY_SECONDS)
 
-            print(
-                "❌ Failed to download radar image."
-            )
-
+        if not validation_succeeded or not png_data:
+            if previous_radar_is_valid():
+                print("⚠️ New MAX (Z) download was empty or invalid.")
+                print("Preserving previous valid radar image.")
+                print("final saved file path:", LATEST_FILE)
+                return LATEST_FILE
+            print("❌ No valid radar image could be downloaded.")
             return
 
-
-        # ----------------------------------------------------
-        # Get image data
-        # ----------------------------------------------------
-
-        image_data = (
-            image_response.content
-        )
-
-
-        if not image_data:
-
-            print(
-                "❌ Empty image received."
-            )
-
-            return
-
-
-        # ----------------------------------------------------
-        # Check content type
-        # ----------------------------------------------------
-
-        content_type = (
-            image_response.headers.get(
-                "Content-Type",
-                ""
-            )
-        )
-
-
-        print(
-            "Content type:",
-            content_type
-        )
+        image_data = png_data
 
 
         # ----------------------------------------------------
@@ -443,19 +496,26 @@ def download_latest_radar():
                 "No update required."
             )
 
+            print("final saved file path:", LATEST_FILE)
+
             return LATEST_FILE
 
 
         # ----------------------------------------------------
-        # Save latest radar image
+        # Save latest radar image as PNG (never write empty bytes)
         # ----------------------------------------------------
 
-        with open(
-            LATEST_FILE,
-            "wb"
-        ) as f:
+        if not image_data:
+            print("❌ Refusing to save an empty radar file.")
+            if previous_radar_is_valid():
+                print("final saved file path:", LATEST_FILE)
+                return LATEST_FILE
+            return
 
+        tmp_file = LATEST_FILE + ".tmp"
+        with open(tmp_file, "wb") as f:
             f.write(image_data)
+        os.replace(tmp_file, LATEST_FILE)
 
 
         # ----------------------------------------------------
@@ -472,6 +532,8 @@ def download_latest_radar():
             "Saved as:",
             LATEST_FILE
         )
+
+        print("final saved file path:", LATEST_FILE)
 
         print(
             "Image size:",
@@ -497,6 +559,10 @@ def download_latest_radar():
             "❌ Network error:",
             e
         )
+        if previous_radar_is_valid():
+            print("Preserving previous valid radar image.")
+            print("final saved file path:", LATEST_FILE)
+            return LATEST_FILE
 
 
     except Exception as e:
@@ -505,6 +571,10 @@ def download_latest_radar():
             "❌ Error:",
             e
         )
+        if previous_radar_is_valid():
+            print("Preserving previous valid radar image.")
+            print("final saved file path:", LATEST_FILE)
+            return LATEST_FILE
 
 
 # ============================================================

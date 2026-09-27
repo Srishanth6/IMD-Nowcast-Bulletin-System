@@ -1,38 +1,52 @@
-import re
+import textwrap
 from datetime import datetime
 from pathlib import Path
 
-from PIL import Image, ImageDraw, ImageFont, ImageOps
+from PIL import Image, ImageDraw, ImageFont
+
+from download_warning_map import atomic_replace
 
 
 ROOT = Path(__file__).resolve().parent
 RADAR_PATH = ROOT / "radar_download" / "radar_images" / "latest_radar.png"
 MAP_PATH = ROOT / "latest_warning_map.png"
+HEADER_PATH = ROOT / "assets" / "imd_header.jpg"
 IMD_HTML_PATH = ROOT / "imd_response.html"
 OUTPUT_PATH = ROOT / "final_bulletin.png"
 
-CANVAS_SIZE = (1600, 1100)
-NAVY = (12, 47, 82)
-BLUE = (32, 91, 145)
-PALE_BLUE = (235, 243, 250)
-INK = (24, 34, 45)
-MUTED = (91, 105, 119)
+CANVAS_SIZE = (1240, 1754)
 WHITE = (255, 255, 255)
+INK = (0, 0, 0)
+ORANGE = (255, 165, 0)
+YELLOW = (255, 255, 0)
 
 
-def load_font(size, bold=False):
-    filename = "arialbd.ttf" if bold else "arial.ttf"
-    font_path = Path(r"C:\Windows\Fonts") / filename
-    try:
-        return ImageFont.truetype(str(font_path), size)
-    except OSError:
-        return ImageFont.load_default()
+def load_font(size, bold=False, telugu=False):
+    windows = Path(r"C:\Windows\Fonts")
+    names = []
+    if telugu:
+        names.append("nirmala.ttf")
+        names.append("Nirmala.ttf")
+    if bold:
+        names.extend(["timesbd.ttf", "times.ttf", "arialbd.ttf"])
+    else:
+        names.extend(["times.ttf", "arial.ttf"])
+    for name in names:
+        path = windows / name
+        if path.is_file():
+            try:
+                return ImageFont.truetype(str(path), size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
 
 
 def read_bulletin_metadata():
     metadata = {}
     if IMD_HTML_PATH.exists():
         html = IMD_HTML_PATH.read_text(encoding="utf-8", errors="replace")
+        import re
+
         patterns = {
             "date": r"Date \(DB\):\s*([^|<]+)",
             "toi": r"Time TOI \(DB\):\s*([^|<]+)",
@@ -59,31 +73,32 @@ def apply_bulletin_times(metadata, issued=None, valid=None):
     return metadata
 
 
-def draw_centered(draw, box, text, font, fill):
+def contain_image(image, box):
     left, top, right, bottom = box
-    bounds = draw.textbbox((0, 0), text, font=font)
-    text_width = bounds[2] - bounds[0]
-    text_height = bounds[3] - bounds[1]
-    draw.text(
-        ((left + right - text_width) / 2, (top + bottom - text_height) / 2),
-        text,
-        font=font,
-        fill=fill,
-    )
+    max_w = max(1, right - left)
+    max_h = max(1, bottom - top)
+    copy = image.copy()
+    copy.thumbnail((max_w, max_h))
+    x = left + (max_w - copy.width) // 2
+    y = top + (max_h - copy.height) // 2
+    return copy, (x, y)
 
 
-def place_image(canvas, image, box):
-    left, top, right, bottom = box
-    inner_box = (left + 12, top + 12, right - 12, bottom - 12)
-    contained = ImageOps.contain(image, (inner_box[2] - inner_box[0], inner_box[3] - inner_box[1]))
-    position = (
-        inner_box[0] + (inner_box[2] - inner_box[0] - contained.width) // 2,
-        inner_box[1] + (inner_box[3] - inner_box[1] - contained.height) // 2,
-    )
-    canvas.alpha_composite(contained, position)
+def draw_wrapped(draw, text, xy, font, fill, max_width, line_gap=6):
+    if not text:
+        return xy[1]
+    x, y = xy
+    lines = []
+    for paragraph in text.splitlines() or [""]:
+        lines.extend(textwrap.wrap(paragraph, width=92) or [""])
+    for line in lines:
+        draw.text((x, y), line, font=font, fill=fill)
+        box = draw.textbbox((x, y), line, font=font)
+        y = box[3] + line_gap
+    return y
 
 
-def main(issued=None, valid=None):
+def main(issued=None, valid=None, warning_sections=None, no_warnings_text=None):
     print("Checking files...")
 
     if not RADAR_PATH.exists():
@@ -94,51 +109,95 @@ def main(issued=None, valid=None):
     radar = Image.open(RADAR_PATH).convert("RGBA")
     warning_map = Image.open(MAP_PATH).convert("RGBA")
     metadata = apply_bulletin_times(read_bulletin_metadata(), issued, valid)
+    warning_sections = warning_sections or {}
+    no_warnings_text = (no_warnings_text or "").strip()
 
-    canvas = Image.new("RGBA", CANVAS_SIZE, WHITE)
+    canvas = Image.new("RGB", CANVAS_SIZE, WHITE)
     draw = ImageDraw.Draw(canvas)
+    margin = 48
+    y = 28
 
-    header_height = 175
-    draw.rectangle((0, 0, CANVAS_SIZE[0], header_height), fill=NAVY)
-    draw.rectangle((0, header_height - 8, CANVAS_SIZE[0], header_height), fill=(226, 162, 44))
+    if HEADER_PATH.is_file():
+        header = Image.open(HEADER_PATH).convert("RGB")
+        header.thumbnail((CANVAS_SIZE[0] - 2 * margin, 150))
+        x = (CANVAS_SIZE[0] - header.width) // 2
+        canvas.paste(header, (x, y))
+        y += header.height + 16
 
-    draw_centered(draw, (40, 18, 1560, 62), "INDIA METEOROLOGICAL DEPARTMENT", load_font(30, True), WHITE)
-    draw_centered(draw, (40, 62, 1560, 112), "NOWCAST BULLETIN", load_font(42, True), WHITE)
-    draw_centered(draw, (40, 112, 1560, 154), "TELANGANA", load_font(27, True), (214, 231, 245))
-
-    issue_line = (
-        f"Date: {metadata['date']}    |    Time of Issue: {metadata['toi']}    |    "
-        f"Valid Up To: {metadata['valid']}"
+    title_font = load_font(28, bold=True)
+    title = "District level Nowcast of Telangana"
+    title_box = draw.textbbox((0, 0), title, font=title_font)
+    draw.text(
+        ((CANVAS_SIZE[0] - (title_box[2] - title_box[0])) // 2, y),
+        title,
+        font=title_font,
+        fill=INK,
     )
-    draw_centered(draw, (40, 900, 1560, 948), issue_line, load_font(23, True), NAVY)
+    y += (title_box[3] - title_box[1]) + 10
+    draw.line((margin, y, CANVAS_SIZE[0] - margin, y), fill=INK, width=2)
+    y += 16
 
-    margin = 40
-    gap = 30
-    panel_top = 205
-    panel_bottom = 875
-    radar_box = (margin, panel_top, 940, panel_bottom)
-    map_box = (margin + 940 + gap, panel_top, 1560, panel_bottom)
+    body_bold = load_font(18, bold=True)
+    issue = f"TIME OF ISSUE: {metadata['date']} ({metadata['toi']} Hrs IST)"
+    valid_line = f"Valid upto: ({metadata['valid']} Hrs IST)"
+    draw.text((margin, y), issue, font=body_bold, fill=INK)
+    valid_box = draw.textbbox((0, 0), valid_line, font=body_bold)
+    draw.text(
+        (CANVAS_SIZE[0] - margin - (valid_box[2] - valid_box[0]), y),
+        valid_line,
+        font=body_bold,
+        fill=INK,
+    )
+    y += 36
 
-    for box in (radar_box, map_box):
-        draw.rounded_rectangle(box, radius=8, fill=PALE_BLUE, outline=BLUE, width=3)
+    body = load_font(16)
+    telugu = load_font(16, telugu=True)
+    heading_fills = {"orange": ORANGE, "yellow": YELLOW, "red": (255, 0, 0)}
+    headings = {
+        "orange": "Orange Warning(Be Prepared)",
+        "yellow": "Yellow Warning(Be Updated)",
+        "red": "Red Warning(Take Action)",
+    }
+    rendered = False
+    for key in ("orange", "yellow", "red"):
+        section = warning_sections.get(key) or {}
+        english = (section.get("english") or "").strip()
+        te = (section.get("telugu") or "").strip()
+        if key == "red" and not english and not te:
+            continue
+        heading = headings[key]
+        hb = draw.textbbox((margin, y), heading, font=body_bold)
+        draw.rectangle((hb[0] - 2, hb[1] - 1, hb[2] + 2, hb[3] + 1), fill=heading_fills[key])
+        draw.text((margin, y), heading, font=body_bold, fill=INK)
+        y = hb[3] + 8
+        if english:
+            y = draw_wrapped(draw, english, (margin, y), body, INK, CANVAS_SIZE[0] - 2 * margin)
+        if te:
+            y = draw_wrapped(draw, te, (margin, y), telugu, INK, CANVAS_SIZE[0] - 2 * margin)
+        if not english and not te and no_warnings_text:
+            y = draw_wrapped(draw, no_warnings_text, (margin, y), telugu, INK, CANVAS_SIZE[0] - 2 * margin)
+        y += 10
+        rendered = True
+    if not rendered and no_warnings_text:
+        y = draw_wrapped(draw, no_warnings_text, (margin, y), telugu, INK, CANVAS_SIZE[0] - 2 * margin)
+        y += 10
 
-    draw.text((radar_box[0] + 18, radar_box[1] + 16), "HYDERABAD RADAR", font=load_font(26, True), fill=NAVY)
-    draw.text((map_box[0] + 18, map_box[1] + 16), "TELANGANA DISTRICT WARNINGS", font=load_font(26, True), fill=NAVY)
+    y += 8
+    panel_bottom = CANVAS_SIZE[1] - 40
+    mid = CANVAS_SIZE[0] // 2
+    radar_img, radar_pos = contain_image(radar, (margin, y, mid - 12, panel_bottom))
+    map_img, map_pos = contain_image(warning_map, (mid + 12, y, CANVAS_SIZE[0] - margin, panel_bottom))
+    canvas.paste(radar_img, radar_pos, radar_img)
+    canvas.paste(map_img, map_pos, map_img)
 
-    place_image(canvas, radar, (radar_box[0], radar_box[1] + 58, radar_box[2], radar_box[3]))
-    place_image(canvas, warning_map, (map_box[0], map_box[1] + 58, map_box[2], map_box[3]))
-
-    draw.line((margin, 980, 1560, 980), fill=(193, 204, 215), width=2)
-    footer = "Source: India Meteorological Department | Telangana nowcast products"
-    draw_centered(draw, (40, 990, 1560, 1032), footer, load_font(18), MUTED)
-    draw_centered(draw, (40, 1035, 1560, 1075), "For official weather information, refer to the latest IMD bulletin.", load_font(16), MUTED)
-
-    canvas.convert("RGB").save(OUTPUT_PATH, quality=95)
-
+    tmp_png = OUTPUT_PATH.with_name(OUTPUT_PATH.stem + ".tmp.png")
+    canvas.save(tmp_png, quality=95)
+    saved_png = atomic_replace(tmp_png, OUTPUT_PATH)
     print("Radar found:", radar.size)
     print("Warning map found:", warning_map.size)
-    print("Integrated image saved: final_bulletin.png")
+    print(f"Integrated image saved: {saved_png.name}")
     print("Final size:", canvas.size)
+    return saved_png
 
 
 if __name__ == "__main__":

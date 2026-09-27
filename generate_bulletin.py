@@ -1,15 +1,17 @@
 """
-IMD Nowcast Bulletin — single-page IMD format.
+IMD Nowcast Bulletin.
 
 Combines Person 1 radar and Person 2 warning-map outputs into a Word
-bulletin that follows the required one-page Telangana nowcast layout.
+bulletin that follows the official Telangana nowcast sample format.
 Times come from the live IMD nowcast page, not hard-coded values.
 """
 
 from __future__ import annotations
 
+import hashlib
 import html as html_lib
 import io
+import json
 import os
 import re
 import shutil
@@ -20,7 +22,6 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urljoin
-from zoneinfo import ZoneInfo
 
 import requests
 from docx import Document
@@ -29,9 +30,12 @@ from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Cm, Inches, Pt, RGBColor
-from PIL import Image
+from PIL import Image, ImageFile
+
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 
 from download_warning_map import URL as IMD_NOWCAST_URL, extract_svg
+from download_warning_map import atomic_replace
 from integrate_bulletin import OUTPUT_PATH as COMPOSITE_PATH
 from integrate_bulletin import main as build_composite_image
 
@@ -50,11 +54,10 @@ SERVED_BULLETIN_NAME = "telangana_nowcast.docx"
 DOWNLOAD_PHP_PATH = ROOT / "dist_nowcast3.php"
 DEFAULT_WX_DIR = Path("/var/www/html/tlng/wx")
 DOWNLOAD_BULLETIN_URL = urljoin(IMD_NOWCAST_URL, "dist_nowcast3.php")
+HTML_BULLETIN_URL = urljoin(IMD_NOWCAST_URL, "dist_nowcast4.php")
+CYCLE_STATE_PATH = ROOT / ".imd_nowcast_cycle_state.json"
 
-try:
-    IST = ZoneInfo("Asia/Kolkata")
-except Exception:
-    IST = timezone(timedelta(hours=5, minutes=30))
+IST = timezone(timedelta(hours=5, minutes=30))
 NOWCAST_VALIDITY = timedelta(hours=3)
 
 ORANGE_FILL = "FFA500"
@@ -80,6 +83,69 @@ class BulletinInputError(FileNotFoundError):
     """Raised when a required bulletin input image is missing."""
 
 
+def load_cycle_state() -> dict:
+    if not CYCLE_STATE_PATH.exists():
+        return {}
+    try:
+        return json.loads(CYCLE_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def save_cycle_state(state: dict) -> dict:
+    CYCLE_STATE_PATH.write_text(json.dumps(state, indent=2, sort_keys=True), encoding="utf-8")
+    return state
+
+
+SKIP_RESTORE = object()
+
+
+def backup_current_outputs() -> dict[Path, bytes | object | None]:
+    backup: dict[Path, bytes | object | None] = {}
+    for target in (OUTPUT_PATH, COMPOSITE_PATH):
+        if not target.exists():
+            backup[target] = None
+            continue
+        try:
+            backup[target] = target.read_bytes()
+        except OSError:
+            print(f"WARNING: {target.name} is locked; leaving the existing file unchanged")
+            backup[target] = SKIP_RESTORE
+    return backup
+
+
+def restore_output_backups(backup: dict[Path, bytes | object | None]) -> None:
+    for target, payload in backup.items():
+        if payload is SKIP_RESTORE:
+            continue
+        tmp_path = target.with_name(target.name + ".restore.tmp")
+        try:
+            if payload is None:
+                if target.exists():
+                    target.unlink()
+                continue
+            tmp_path.write_bytes(payload)
+            os.replace(os.fspath(tmp_path.resolve()), os.fspath(target.resolve()))
+        except OSError:
+            print(f"WARNING: could not restore locked file: {target.name}")
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+
+
+def radar_file_metadata(path: Path) -> dict | None:
+    if not path or not path.exists():
+        return None
+    try:
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        timestamp = datetime.fromtimestamp(path.stat().st_mtime, tz=IST).strftime("%Y-%m-%d %H:%M:%S IST")
+        return {"hash": digest, "timestamp": timestamp}
+    except Exception:
+        return None
+
+
 def datetimes_from_imd(page_fields: dict):
     """Use the issue time published on the latest IMD page, not the local clock."""
     date_db = page_fields.get("date_db")
@@ -101,6 +167,119 @@ def datetimes_from_imd(page_fields: dict):
 
 def _has_telugu(text: str) -> bool:
     return bool(re.search(r"[\u0C00-\u0C7F]", text))
+
+
+def _is_structural_bulletin_run(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text).lower()
+    return compact.startswith(
+        (
+            "orangewarning",
+            "yellowwarning",
+            "redwarning",
+            "timeofissue",
+            "validupto",
+            "districtlevelnowcast",
+            "nowarnings",
+        )
+    ) or "duty officer" in text.lower() or "డ్యూటీ" in text
+
+
+def _warning_heading_key(text: str) -> str | None:
+    compact = re.sub(r"\s+", "", text).lower()
+    if compact.startswith("orangewarning"):
+        return "orange"
+    if compact.startswith("yellowwarning"):
+        return "yellow"
+    if compact.startswith("redwarning"):
+        return "red"
+    return None
+
+
+def _split_no_warnings(text: str | None) -> tuple[str, str]:
+    text = html_lib.unescape((text or "").strip())
+    if not text:
+        return "", ""
+    parts = [part.strip() for part in re.split(r"\s*/\s*", text) if part.strip()]
+    english = ""
+    telugu = ""
+    for part in parts:
+        if _has_telugu(part) and not english:
+            telugu = part if not telugu else telugu
+        elif _has_telugu(part):
+            telugu = part
+        else:
+            english = part
+    if _has_telugu(text) and not telugu:
+        telugu = text
+    if re.search(r"[A-Za-z]", text) and not english:
+        english = parts[0] if parts else text
+    return english, telugu
+
+
+def _paragraphs_from_docx(docx_bytes: bytes) -> list[str]:
+    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
+        xml = archive.read("word/document.xml")
+    root = ET.fromstring(xml)
+    paragraphs = []
+    for para in root.iter(f"{W_NS}p"):
+        text = "".join(node.text or "" for node in para.iter(f"{W_NS}t"))
+        text = html_lib.unescape(re.sub(r"\s+", " ", text)).strip()
+        if text:
+            paragraphs.append(text)
+    return paragraphs
+
+
+def _sections_from_blocks(blocks: list[str]) -> dict:
+    sections = {}
+    no_warnings_text = None
+    no_warnings_english = ""
+    no_warnings_telugu = ""
+    index = 0
+    while index < len(blocks):
+        block = blocks[index]
+        if re.search(r"no\s*warnings", block, flags=re.I) or "హెచ్చరికలు లేవు" in block:
+            if _has_telugu(block) and not re.search(r"[A-Za-z]", block):
+                no_warnings_telugu = block
+            elif re.search(r"no\s*warnings", block, flags=re.I) and not _has_telugu(block):
+                no_warnings_english = block
+            else:
+                no_warnings_text = block
+                english, telugu = _split_no_warnings(block)
+                no_warnings_english = no_warnings_english or english
+                no_warnings_telugu = no_warnings_telugu or telugu
+            index += 1
+            continue
+        matched_key = _warning_heading_key(block)
+        if matched_key is None:
+            index += 1
+            continue
+        english = ""
+        telugu = ""
+        next_index = index + 1
+        while next_index < len(blocks) and not _is_structural_bulletin_run(blocks[next_index]) and _warning_heading_key(blocks[next_index]) is None:
+            candidate = blocks[next_index]
+            if _has_telugu(candidate) and not re.search(r"[A-Za-z]", candidate):
+                telugu = f"{telugu} {candidate}".strip() if telugu else candidate
+            elif english:
+                if _has_telugu(candidate):
+                    telugu = f"{telugu} {candidate}".strip() if telugu else candidate
+                else:
+                    english = f"{english} {candidate}".strip()
+            else:
+                english = candidate
+            next_index += 1
+            if english and telugu:
+                break
+        sections[matched_key] = {"english": english, "telugu": telugu}
+        index = next_index
+    if not no_warnings_text and (no_warnings_english or no_warnings_telugu):
+        no_warnings_text = " / ".join(part for part in (no_warnings_english, no_warnings_telugu) if part)
+    return {
+        "sections": sections,
+        "no_warnings_text": no_warnings_text,
+        "no_warnings_english": no_warnings_english,
+        "no_warnings_telugu": no_warnings_telugu,
+    }
 
 
 def parse_nowcast_page(page_html: str) -> dict:
@@ -142,43 +321,78 @@ def parse_nowcast_page(page_html: str) -> dict:
 
 
 def parse_official_bulletin_docx(docx_bytes: bytes) -> dict:
-    """Extract Orange/Yellow/Red English and Telugu text from IMD's Word bulletin."""
-    sections = {}
-    with zipfile.ZipFile(io.BytesIO(docx_bytes)) as archive:
-        xml = archive.read("word/document.xml")
-    root = ET.fromstring(xml)
-    runs = []
-    for node in root.iter(f"{W_NS}t"):
-        if node.text:
-            runs.append(html_lib.unescape(node.text).strip())
+    """Extract warning body text from IMD's Word bulletin, without inventing districts."""
+    return _sections_from_blocks(_paragraphs_from_docx(docx_bytes))
 
-    heading_keys = {
-        "orange warning": "orange",
-        "yellow warning": "yellow",
-        "red warning": "red",
+
+def parse_official_bulletin_html(html: str) -> dict:
+    """Extract warning body text from IMD's HTML Word bulletin (dist_nowcast4.php)."""
+    cleaned = re.sub(r"<style\b[^>]*>.*?</style>", " ", html, flags=re.I | re.S)
+    cleaned = re.sub(r"<script\b[^>]*>.*?</script>", " ", cleaned, flags=re.I | re.S)
+    cleaned = re.sub(r"<img\b[^>]*>", " ", cleaned, flags=re.I)
+    blocks = []
+    for match in re.finditer(
+        r"<(h[1-6]|p|td|div|li)(?:\s[^>]*)?>(.*?)</\1>",
+        cleaned,
+        flags=re.I | re.S,
+    ):
+        text = re.sub(r"<[^>]+>", " ", match.group(2))
+        text = html_lib.unescape(re.sub(r"\s+", " ", text)).strip()
+        if text and text not in blocks:
+            blocks.append(text)
+    return _sections_from_blocks(blocks)
+
+
+def _merge_section(primary: dict | None, secondary: dict | None) -> dict:
+    primary = primary or {}
+    secondary = secondary or {}
+    return {
+        "english": (primary.get("english") or secondary.get("english") or "").strip(),
+        "telugu": (primary.get("telugu") or secondary.get("telugu") or "").strip(),
     }
-    index = 0
-    while index < len(runs):
-        compact = re.sub(r"\s+", "", runs[index]).lower()
-        matched_key = None
-        for prefix, key in heading_keys.items():
-            if compact.startswith(prefix.replace(" ", "")):
-                matched_key = key
-                break
-        if matched_key is None:
-            index += 1
+
+
+def merge_warning_parses(*parsed: dict) -> dict:
+    sections = {}
+    no_warnings_text = None
+    no_warnings_english = ""
+    no_warnings_telugu = ""
+    for item in parsed:
+        if not item:
             continue
-        english = ""
-        telugu = ""
-        if index + 1 < len(runs):
-            english = runs[index + 1]
-        if index + 2 < len(runs) and _has_telugu(runs[index + 2]):
-            telugu = runs[index + 2]
-            index += 3
-        else:
-            index += 2
-        sections[matched_key] = {"english": english, "telugu": telugu}
-    return sections
+        for key, section in (item.get("sections") or {}).items():
+            sections[key] = _merge_section(sections.get(key), section)
+        no_warnings_text = no_warnings_text or item.get("no_warnings_text")
+        no_warnings_english = no_warnings_english or (item.get("no_warnings_english") or "")
+        no_warnings_telugu = no_warnings_telugu or (item.get("no_warnings_telugu") or "")
+    if no_warnings_text and not (no_warnings_english or no_warnings_telugu):
+        no_warnings_english, no_warnings_telugu = _split_no_warnings(no_warnings_text)
+    if not no_warnings_text and (no_warnings_english or no_warnings_telugu):
+        no_warnings_text = " / ".join(part for part in (no_warnings_english, no_warnings_telugu) if part)
+    return {
+        "sections": sections,
+        "no_warnings_text": no_warnings_text,
+        "no_warnings_english": no_warnings_english,
+        "no_warnings_telugu": no_warnings_telugu,
+    }
+
+
+def resolve_warning_sections(warning_data: dict) -> dict:
+    """Fill Orange/Yellow slots from live IMD text; never invent districts."""
+    sections = dict(warning_data.get("warning_sections") or {})
+    notice_en = (warning_data.get("no_warnings_english") or "").strip()
+    notice_te = (warning_data.get("no_warnings_telugu") or "").strip()
+    if not notice_en and not notice_te:
+        notice_en, notice_te = _split_no_warnings(warning_data.get("no_warnings_text"))
+    resolved = {}
+    for key, _title, _fill in LEVELS:
+        section = _merge_section(sections.get(key), None)
+        has_level_text = bool(section["english"] or section["telugu"])
+        if not has_level_text and key in ALWAYS_SHOW_LEVELS and (notice_en or notice_te):
+            section = {"english": notice_en, "telugu": notice_te}
+        if section["english"] or section["telugu"] or key in ALWAYS_SHOW_LEVELS:
+            resolved[key] = section
+    return resolved
 
 
 def fetch_nowcast_page() -> str:
@@ -206,28 +420,84 @@ def load_imd_warning_content(page_html: str) -> dict:
     print("  English/Telugu warning sentences: not present on this page")
     print("  District name attributes: not present in the SVG")
 
-    warning_sections = {}
-    href = page_fields["official_bulletin_href"]
-    if href:
-        bulletin_url = urljoin(IMD_NOWCAST_URL, href)
-        print("Fetching official IMD warning text from:")
-        print(f"  {bulletin_url}")
+    parsed_sources = []
+    href = page_fields["official_bulletin_href"] or "dist_nowcast3.php"
+    bulletin_url = urljoin(IMD_NOWCAST_URL, href)
+    print("Fetching official IMD warning text from:")
+    print(f"  {bulletin_url}")
+    try:
         bulletin = requests.get(bulletin_url, timeout=60)
         bulletin.raise_for_status()
-        warning_sections = parse_official_bulletin_docx(bulletin.content)
+        parsed_docx = parse_official_bulletin_docx(bulletin.content)
+        parsed_sources.append(parsed_docx)
         print("Fields available in the official IMD Word bulletin:")
+        if parsed_docx.get("no_warnings_text"):
+            print(f"  Official notice: {parsed_docx['no_warnings_text']}")
         for key in ("orange", "yellow", "red"):
-            section = warning_sections.get(key)
-            if section:
-                print(f"  {key} English: {section['english'][:90]}...")
-                print(f"  {key} Telugu: present" if section["telugu"] else f"  {key} Telugu: absent")
+            section = (parsed_docx.get("sections") or {}).get(key)
+            if section and (section.get("english") or section.get("telugu")):
+                english = section.get("english") or ""
+                print(f"  {key} English: {english[:90]}..." if english else f"  {key} English: absent")
+                print(f"  {key} Telugu: present" if section.get("telugu") else f"  {key} Telugu: absent")
             else:
                 print(f"  {key}: not present")
+    except Exception as error:
+        print(f"WARNING: could not parse dist_nowcast3.php: {error}")
 
+    print("Fetching IMD HTML nowcast bulletin from:")
+    print(f"  {HTML_BULLETIN_URL}")
+    try:
+        html_bulletin = requests.get(HTML_BULLETIN_URL, timeout=60)
+        html_bulletin.raise_for_status()
+        html_text = html_bulletin.content.decode("utf-8", errors="replace")
+        parsed_html = parse_official_bulletin_html(html_text)
+        parsed_sources.append(parsed_html)
+        print("Fields available in dist_nowcast4.php:")
+        if parsed_html.get("no_warnings_text"):
+            print(f"  Official notice: {parsed_html['no_warnings_text']}")
+        for key in ("orange", "yellow", "red"):
+            section = (parsed_html.get("sections") or {}).get(key)
+            if section and (section.get("english") or section.get("telugu")):
+                english = section.get("english") or ""
+                print(f"  {key} English: {english[:90]}..." if english else f"  {key} English: absent")
+                print(f"  {key} Telugu: present" if section.get("telugu") else f"  {key} Telugu: absent")
+            else:
+                print(f"  {key}: not present")
+    except Exception as error:
+        print(f"WARNING: could not parse dist_nowcast4.php: {error}")
+
+    merged = merge_warning_parses(*parsed_sources)
     return {
         "page_fields": page_fields,
-        "warning_sections": warning_sections,
+        "warning_sections": merged.get("sections") or {},
+        "no_warnings_text": merged.get("no_warnings_text"),
+        "no_warnings_english": merged.get("no_warnings_english") or "",
+        "no_warnings_telugu": merged.get("no_warnings_telugu") or "",
     }
+
+
+def _section_text(section: dict | None) -> str:
+    if not section:
+        return "none"
+    english = (section.get("english") or "").strip()
+    telugu = (section.get("telugu") or "").strip()
+    if english and telugu:
+        return f"{english} | {telugu}"
+    return english or telugu or "none"
+
+
+def print_imd_warning_data(warning_data: dict) -> None:
+    resolved = resolve_warning_sections(warning_data)
+    fills = warning_data.get("page_fields", {}).get("map_fill_counts") or {}
+    notice = warning_data.get("no_warnings_text") or "none"
+    print("=== IMD WARNING DATA ===")
+    print(f"Orange Warning: {_section_text(resolved.get('orange'))}")
+    print(f"Yellow Warning: {_section_text(resolved.get('yellow'))}")
+    print(
+        "District Warning Data: "
+        f"official notice={notice}; map fills={dict(fills)}"
+    )
+    print("========================")
 
 
 def format_issue_line(issued: datetime) -> str:
@@ -246,7 +516,7 @@ def format_bottom_timestamp(issued: datetime, valid: datetime) -> str:
     )
 
 
-def set_run_font(run, name="Arial", size=11, bold=False, color=None):
+def set_run_font(run, name="Times New Roman", size=11, bold=False, color=None):
     run.font.name = name
     run.font.size = Pt(size)
     run.font.bold = bold
@@ -265,37 +535,38 @@ def set_cell_width(cell, width):
     cell.width = width
 
 
-def shade_cell(cell, fill: str):
-    tc_pr = cell._tc.get_or_add_tcPr()
+def shade_run(run, fill: str):
+    rpr = run._element.get_or_add_rPr()
     shading = OxmlElement("w:shd")
     shading.set(qn("w:val"), "clear")
-    shading.set(qn("w:color"), "auto")
     shading.set(qn("w:fill"), fill)
-    tc_pr.append(shading)
+    rpr.append(shading)
 
 
-def set_cell_borders(cell, color=BORDER_BLUE, size="8"):
-    tc_pr = cell._tc.get_or_add_tcPr()
-    borders = OxmlElement("w:tcBorders")
-    for edge in ("top", "left", "bottom", "right"):
+def disable_table_borders(table):
+    tbl = table._tbl
+    tbl_pr = tbl.tblPr
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
         element = OxmlElement(f"w:{edge}")
-        element.set(qn("w:val"), "single")
-        element.set(qn("w:sz"), size)
+        element.set(qn("w:val"), "nil")
+        element.set(qn("w:sz"), "0")
         element.set(qn("w:space"), "0")
-        element.set(qn("w:color"), color)
+        element.set(qn("w:color"), "auto")
         borders.append(element)
-    tc_pr.append(borders)
+    tbl_pr.append(borders)
 
 
-def set_cell_margins(cell, top=100, bottom=100, start=140, end=140):
-    tc_pr = cell._tc.get_or_add_tcPr()
-    margins = OxmlElement("w:tcMar")
-    for name, value in (("top", top), ("bottom", bottom), ("start", start), ("end", end)):
-        node = OxmlElement(f"w:{name}")
-        node.set(qn("w:w"), str(value))
-        node.set(qn("w:type"), "dxa")
-        margins.append(node)
-    tc_pr.append(margins)
+def add_bottom_border(paragraph):
+    p_pr = paragraph._p.get_or_add_pPr()
+    p_bdr = OxmlElement("w:pBdr")
+    bottom = OxmlElement("w:bottom")
+    bottom.set(qn("w:val"), "single")
+    bottom.set(qn("w:sz"), "12")
+    bottom.set(qn("w:space"), "4")
+    bottom.set(qn("w:color"), "000000")
+    p_bdr.append(bottom)
+    p_pr.append(p_bdr)
 
 
 def add_paragraph(document, text="", *, align="left", space_after=4, space_before=0):
@@ -308,7 +579,7 @@ def add_paragraph(document, text="", *, align="left", space_after=4, space_befor
     paragraph.alignment = alignment
     paragraph.paragraph_format.space_before = Pt(space_before)
     paragraph.paragraph_format.space_after = Pt(space_after)
-    paragraph.paragraph_format.line_spacing = 1.0
+    paragraph.paragraph_format.line_spacing = 1.08
     if text:
         run = paragraph.add_run(text)
         set_run_font(run)
@@ -337,93 +608,169 @@ def require_input(path: Path, label: str):
     return path
 
 
-def add_page_header(section):
-    header = section.header
-    paragraph = header.paragraphs[0]
-    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+def add_page_break(document):
+    paragraph = document.add_paragraph()
+    paragraph.paragraph_format.space_before = Pt(0)
     paragraph.paragraph_format.space_after = Pt(0)
-    run = paragraph.add_run("INDIA METEOROLOGICAL DEPARTMENT")
-    set_run_font(run, size=10, bold=True, color=NAVY)
+    paragraph.add_run().add_break(WD_BREAK.PAGE)
 
 
-def add_datetime_table(document, issued: datetime, valid: datetime):
-    table = document.add_table(rows=1, cols=3)
-    table.alignment = WD_TABLE_ALIGNMENT.CENTER
-    table.autofit = False
-    cell_width = Inches(2.366)
-    values = (
-        ("BULLETIN DATE", issued.strftime("%Y-%m-%d")),
-        ("TIME OF ISSUE", issued.strftime("%H:%M:%S")),
-        ("VALID UP TO", valid.strftime("%H:%M:%S")),
-    )
-    for cell, (label, value) in zip(table.rows[0].cells, values):
-        set_cell_width(cell, cell_width)
-        shade_cell(cell, PALE_FILL)
-        set_cell_borders(cell)
-        set_cell_margins(cell)
-        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-        cell.text = ""
-        paragraph = cell.paragraphs[0]
-        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
-        paragraph.paragraph_format.space_after = Pt(2)
-        label_run = paragraph.add_run(label)
-        set_run_font(label_run, size=8.5, bold=True, color=BLUE)
-        label_run.add_break()
-        value_run = paragraph.add_run(value)
-        set_run_font(value_run, size=11, bold=True, color=INK)
-    return table
+def add_impact_page(document, image_path: Path, label: str):
+    if not image_path.is_file():
+        print(f"WARNING: {label} reference page not found: {image_path.relative_to(ROOT).as_posix()}")
+        return
+    paragraph = add_paragraph(document, align="center", space_before=6, space_after=6)
+    width, height = picture_size(image_path, 6.25, 9.4)
+    paragraph.add_run().add_picture(str(image_path), width=width, height=height)
+    print(f"Loaded {label}: {image_path.relative_to(ROOT).as_posix()}")
+
+
+def add_warning_block(document, title: str, fill: str, english: str, telugu: str = ""):
+    heading = add_paragraph(document, space_after=2, space_before=4)
+    run = heading.add_run(title)
+    set_run_font(run, size=12, bold=True)
+    shade_run(run, fill)
+
+    if english:
+        english_para = add_paragraph(document, space_after=2)
+        english_run = english_para.add_run(english)
+        set_run_font(english_run, size=11)
+
+    if telugu:
+        telugu_para = add_paragraph(document, space_after=6)
+        telugu_run = telugu_para.add_run(telugu)
+        set_run_font(telugu_run, name="Nirmala UI", size=11)
 
 
 def build_document(radar_path: Path, map_path: Path, warning_data: dict, issued: datetime, valid: datetime):
     print(format_issue_line(issued))
     print(format_valid_line(valid))
-    print(format_bottom_timestamp(issued, valid))
     require_input(radar_path, "Hyderabad radar image")
     require_input(map_path, "Telangana warning map")
 
-    print("Building IMD-style bulletin visual...")
-    build_composite_image(issued=issued, valid=valid)
-    composite_path = require_input(COMPOSITE_PATH, "integrated bulletin visual")
-
     document = Document()
     section = document.sections[0]
-    section.page_width = Inches(8.5)
-    section.page_height = Inches(11)
-    section.top_margin = Inches(0.55)
-    section.bottom_margin = Inches(0.55)
-    section.left_margin = Inches(0.7)
-    section.right_margin = Inches(0.7)
-    section.header_distance = Inches(0.25)
-    add_page_header(section)
+    section.page_width = Cm(21.0)
+    section.page_height = Cm(29.7)
+    section.top_margin = Cm(1.27)
+    section.bottom_margin = Cm(1.27)
+    section.left_margin = Cm(1.27)
+    section.right_margin = Cm(1.27)
 
-    title = add_paragraph(document, align="center", space_before=6, space_after=2)
-    title_run = title.add_run("NOWCAST BULLETIN")
-    set_run_font(title_run, size=24, bold=True, color=NAVY)
+    header = add_paragraph(document, align="center", space_after=0)
+    if HEADER_PATH.is_file():
+        header_width, header_height = picture_size(HEADER_PATH, 6.25, 1.36)
+        header.add_run().add_picture(
+            str(HEADER_PATH),
+            width=header_width,
+            height=header_height,
+        )
+        print(f"Loaded IMD header: {HEADER_PATH.relative_to(ROOT).as_posix()}")
+    else:
+        run = header.add_run(
+            "Government of India (Ministry of Earth Sciences)  |  "
+            "India Meteorological Department  |  Meteorological Centre, Hyderabad"
+        )
+        set_run_font(run, size=12, bold=True)
 
-    state = add_paragraph(document, align="center", space_before=0, space_after=12)
-    state_run = state.add_run("TELANGANA")
-    set_run_font(state_run, size=15, bold=True, color=BLUE)
+    title = add_paragraph(document, align="center", space_before=4, space_after=4)
+    title_run = title.add_run("District level Nowcast of Telangana")
+    set_run_font(title_run, size=16, bold=True)
+    add_bottom_border(title)
 
-    add_datetime_table(document, issued, valid)
-    add_paragraph(document, space_after=0)
+    usable_width = section.page_width - section.left_margin - section.right_margin
+    half = usable_width // 2
+    time_table = document.add_table(rows=1, cols=2)
+    time_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    disable_table_borders(time_table)
+    left_cell, right_cell = time_table.rows[0].cells
+    set_cell_width(left_cell, int(half))
+    set_cell_width(right_cell, int(half))
 
-    visual = add_paragraph(document, align="center", space_before=4, space_after=10)
-    width, height = picture_size(composite_path, 7.1, 4.9)
-    visual.add_run().add_picture(str(composite_path), width=width, height=height)
+    left_cell.text = ""
+    left_para = left_cell.paragraphs[0]
+    left_run = left_para.add_run(format_issue_line(issued))
+    set_run_font(left_run, size=11, bold=True)
 
-    separator = add_paragraph(document, align="center", space_before=0, space_after=5)
-    sep_run = separator.add_run("_" * 64)
-    set_run_font(sep_run, size=7, color=GOLD)
+    right_cell.text = ""
+    right_para = right_cell.paragraphs[0]
+    right_para.alignment = WD_ALIGN_PARAGRAPH.RIGHT
+    right_run = right_para.add_run(format_valid_line(valid))
+    set_run_font(right_run, size=11, bold=True)
 
-    source = add_paragraph(document, align="center", space_after=0)
-    source_run = source.add_run(
-        "Source: India Meteorological Department | Telangana nowcast products"
+    add_paragraph(document, space_after=2)
+
+    warning_sections = resolve_warning_sections(warning_data)
+    no_warnings_text = (warning_data.get("no_warnings_text") or "").strip()
+    rendered_warning_text = False
+    for key, title_text, fill in LEVELS:
+        section_data = warning_sections.get(key) or {}
+        english = (section_data.get("english") or "").strip()
+        telugu = (section_data.get("telugu") or "").strip()
+        if key not in ALWAYS_SHOW_LEVELS and not english and not telugu:
+            continue
+        add_warning_block(document, title_text, fill, english, telugu)
+        rendered_warning_text = bool(english or telugu) or rendered_warning_text
+        print(f"{title_text}: {english or telugu or '(heading only)'}")
+    if not rendered_warning_text:
+        print("Official IMD bulletin did not include Orange/Yellow/Red warning sentences.")
+
+    image_table = document.add_table(rows=1, cols=2)
+    image_table.alignment = WD_TABLE_ALIGNMENT.CENTER
+    disable_table_borders(image_table)
+    radar_cell, map_cell = image_table.rows[0].cells
+    set_cell_width(radar_cell, int(half))
+    set_cell_width(map_cell, int(half))
+    radar_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    map_cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+
+    radar_cell.text = ""
+    radar_para = radar_cell.paragraphs[0]
+    radar_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    radar_w, radar_h = picture_size(radar_path, 3.47, 2.84)
+    radar_para.add_run().add_picture(str(radar_path), width=radar_w, height=radar_h)
+
+    map_cell.text = ""
+    map_para = map_cell.paragraphs[0]
+    map_para.alignment = WD_ALIGN_PARAGRAPH.LEFT
+    map_w, map_h = picture_size(map_path, 3.47, 4.01)
+    map_para.add_run().add_picture(str(map_path), width=map_w, height=map_h)
+
+    add_page_break(document)
+    add_impact_page(
+        document,
+        PAGE2_IMPACTS_PATH,
+        "Page 2 Expected Impacts (Moderate Thunderstorm/Lightning)",
     )
-    set_run_font(source_run, size=8.5, color=INK)
+    add_page_break(document)
+    add_impact_page(
+        document,
+        PAGE3_IMPACTS_PATH,
+        "Page 3 Expected Impacts (Heavy Rain)",
+    )
+    add_page_break(document)
+    add_impact_page(
+        document,
+        PAGE4_IMPACTS_PATH,
+        "Page 4 Expected Impacts (Very Severe Thunderstorm/Squall)",
+    )
 
-    fill_counts = warning_data.get("page_fields", {}).get("map_fill_counts") or Counter()
-    print(f"Map polygon fills used in the visual: {dict(fill_counts)}")
-    return document
+    duty = add_paragraph(document, align="right", space_before=18, space_after=0)
+    duty_run = duty.add_run("డ్యూటీ అధికారి / ड्यूटी अधिकारी / Duty Officer")
+    set_run_font(duty_run, name="Nirmala UI", size=12)
+
+    print("Building verification image final_bulletin.png...")
+    png_saved = None
+    try:
+        png_saved = build_composite_image(
+            issued=issued,
+            valid=valid,
+            warning_sections=warning_sections,
+            no_warnings_text=no_warnings_text,
+        )
+    except Exception as error:
+        print(f"WARNING: could not write final_bulletin.png: {error}")
+    return document, png_saved
 
 
 def nowcast_wx_directories() -> list[Path]:
@@ -495,86 +842,186 @@ def live_download_matches(docx_path: Path) -> bool:
     return response.content == docx_path.read_bytes()
 
 
+def require_readable_image(path: Path, label: str) -> Path:
+    try:
+        with Image.open(path) as image:
+            image.load()
+    except Exception as error:
+        raise BulletinInputError(f"{label} is unreadable: {path} ({error})") from error
+    return path
+
+
+def run_bulletin_cycle():
+    started_at = datetime.now(IST)
+    print(f"[{started_at.strftime('%H:%M')} IST] Starting bulletin cycle")
+
+    backup = backup_current_outputs()
+    previous_state = load_cycle_state()
+    previous_radar_hash = previous_state.get("radar_hash")
+    previous_radar_time = previous_state.get("radar_timestamp")
+    previous_issue = previous_state.get("issue_time")
+
+    try:
+        print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Fetching latest IMD data")
+        page_html = fetch_nowcast_page()
+
+        try:
+            from radar_download.radar_scraper import download_latest_radar
+
+            print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Downloading latest radar image")
+            radar_file = download_latest_radar()
+        except Exception as error:
+            raise RuntimeError(f"could not download the latest radar image: {error}") from error
+
+        if not radar_file or not Path(radar_file).is_file():
+            raise RuntimeError("the latest radar image was not downloaded")
+        radar_path = Path(radar_file)
+        try:
+            require_readable_image(radar_path, "Hyderabad radar image")
+        except BulletinInputError as error:
+            print(f"WARNING: {error}. Continuing with the downloaded file.")
+        radar_meta = radar_file_metadata(radar_path)
+        if radar_meta:
+            print(f"Latest radar timestamp: {radar_meta['timestamp']}")
+            if previous_radar_hash and previous_radar_hash == radar_meta["hash"]:
+                print(f"Previous radar timestamp: {previous_radar_time or 'n/a'}")
+                print("Radar source has not published a newer image yet; using the latest available file.")
+        print(f"Latest radar saved: {radar_path.as_posix()}")
+
+        try:
+            from download_warning_map import save_warning_map
+
+            print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Downloading latest warning map")
+            map_path = save_warning_map(page_html)
+        except Exception as error:
+            raise RuntimeError(f"could not download the latest warning map: {error}") from error
+        print(f"Latest warning map saved: {Path(map_path).as_posix()}")
+
+        try:
+            warning_data = load_imd_warning_content(page_html)
+            issued, valid = datetimes_from_imd(warning_data["page_fields"])
+        except Exception as error:
+            raise RuntimeError(f"could not extract the IMD issue time: {error}") from error
+
+        if previous_issue and previous_issue == issued.strftime("%Y-%m-%d %H:%M:%S"):
+            print(f"Previous issue time: {previous_issue}")
+            print(f"Latest issue time: {issued.strftime('%Y-%m-%d %H:%M:%S')} IST")
+            print("IMD source time is unchanged; regenerating the bulletin with the latest available data.")
+
+        print(
+            "Issue time extracted: "
+            f"{issued.strftime('%Y-%m-%d')} ({issued.strftime('%H:%M:%S')} Hrs IST)"
+        )
+        print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Generating bulletin")
+        print_imd_warning_data(warning_data)
+
+        document, png_saved = build_document(radar_path, map_path, warning_data, issued, valid)
+        temp_output = OUTPUT_PATH.with_name(OUTPUT_PATH.stem + ".tmp.docx")
+        document.save(str(temp_output))
+        try:
+            saved_path = atomic_replace(temp_output, OUTPUT_PATH)
+        except OSError as error:
+            if temp_output.exists():
+                try:
+                    temp_output.unlink()
+                except OSError:
+                    pass
+            raise RuntimeError(f"could not save the bulletin DOCX: {error}") from error
+        if temp_output.exists():
+            try:
+                temp_output.unlink()
+            except OSError:
+                pass
+
+        docx_replaced = saved_path.resolve() == OUTPUT_PATH.resolve()
+        png_replaced = bool(png_saved) and Path(png_saved).resolve() == COMPOSITE_PATH.resolve()
+        if not docx_replaced:
+            print(
+                f"WARNING: {OUTPUT_PATH.name} is open/locked. "
+                f"Latest bulletin saved as {saved_path.name}. "
+                "Close Word and rerun to replace the main bulletin file."
+            )
+        if png_saved and not png_replaced:
+            print(
+                f"WARNING: {COMPOSITE_PATH.name} is open/locked. "
+                f"Latest PNG saved as {Path(png_saved).name}."
+            )
+        if not png_saved:
+            print(f"WARNING: {COMPOSITE_PATH.name} was not written.")
+
+        published = publish_generated_bulletin(saved_path)
+        complete = docx_replaced and png_replaced
+        save_cycle_state(
+            {
+                "status": "success" if complete else "locked",
+                "issue_time": issued.strftime("%Y-%m-%d %H:%M:%S"),
+                "valid_time": valid.strftime("%Y-%m-%d %H:%M:%S"),
+                "radar_hash": radar_meta["hash"] if radar_meta else None,
+                "radar_timestamp": radar_meta["timestamp"] if radar_meta else None,
+                "generated_at": datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "published": [str(path) for path in published],
+                "docx": str(saved_path),
+                "png": str(png_saved) if png_saved else None,
+            }
+        )
+
+        if complete:
+            print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Bulletin generated successfully")
+        else:
+            print(
+                f"[{datetime.now(IST).strftime('%H:%M')} IST] Bulletin cycle finished, "
+                "but a required output file was locked and was not replaced."
+            )
+        print(f"Saved: {saved_path.name}")
+        if published:
+            print("Published for Download Nowcast Bulletin:")
+            for path in published:
+                print(f"  {path.as_posix()}")
+            print(f"Download URL: {DOWNLOAD_BULLETIN_URL}")
+            if live_download_matches(OUTPUT_PATH):
+                print("Download Nowcast Bulletin is serving this generated bulletin.")
+            else:
+                print(
+                    "WARNING: the IP download link is still serving the previous "
+                    "server-generated bulletin. Run this script on the IMD Apache "
+                    "host (or set IMD_WX_DIR to /var/www/html/tlng/wx) so "
+                    "dist_nowcast3.php and IMD_Nowcast_Bulletin.docx land in that folder."
+                )
+        else:
+            print(
+                "WARNING: could not copy the bulletin into the IMD wx folder. "
+                "Set IMD_WX_DIR to /var/www/html/tlng/wx on the Apache server."
+            )
+        return {
+            "status": "success" if complete else "locked",
+            "issued": issued,
+            "valid": valid,
+            "radar": radar_meta,
+            "docx": saved_path,
+            "png": png_saved,
+        }
+
+    except Exception as error:
+        restore_output_backups(backup)
+        print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Bulletin cycle failed: {error}")
+        return {"status": "failed", "error": str(error)}
+
+
 def main():
     print("=" * 60)
     print(" IMD NOWCAST BULLETIN")
     print("=" * 60)
     os.chdir(ROOT)
-    print("Fetching latest IMD data...")
-
-    try:
-        page_html = fetch_nowcast_page()
-    except Exception as error:
-        print(f"ERROR: could not fetch the latest IMD nowcast page: {error}")
+    result = run_bulletin_cycle()
+    if result["status"] == "success":
+        return 0
+    if result["status"] == "stale":
+        print("No new bulletin generated because the latest IMD/radar data is unchanged.")
+        return 0
+    if result["status"] == "locked":
+        print("A required output file was locked. Close it and run generate_bulletin.py again.")
         return 1
-
-    try:
-        from radar_download.radar_scraper import download_latest_radar
-
-        print("Downloading latest radar image...")
-        radar_file = download_latest_radar()
-    except Exception as error:
-        print(f"ERROR: could not download the latest radar image: {error}")
-        return 1
-    if not radar_file or not Path(radar_file).is_file():
-        print("ERROR: the latest radar image was not downloaded.")
-        return 1
-    radar_path = Path(radar_file)
-    print(f"Latest radar saved: {radar_path.as_posix()}")
-
-    try:
-        from download_warning_map import save_warning_map
-
-        print("Downloading latest warning map...")
-        map_path = save_warning_map(page_html)
-    except Exception as error:
-        print(f"ERROR: could not download the latest warning map: {error}")
-        return 1
-    print(f"Latest warning map saved: {Path(map_path).as_posix()}")
-
-    try:
-        warning_data = load_imd_warning_content(page_html)
-        issued, valid = datetimes_from_imd(warning_data["page_fields"])
-    except Exception as error:
-        print(f"ERROR: could not extract the IMD issue time: {error}")
-        return 1
-
-    print(
-        "Issue time extracted: "
-        f"{issued.strftime('%Y-%m-%d')} ({issued.strftime('%H:%M:%S')} Hrs IST)"
-    )
-    print("Generating final bulletin...")
-
-    try:
-        document = build_document(radar_path, map_path, warning_data, issued, valid)
-        document.save(OUTPUT_PATH)
-        published = publish_generated_bulletin(OUTPUT_PATH)
-    except Exception as error:
-        print(f"ERROR: could not generate the bulletin: {error}")
-        return 1
-
-    print("Bulletin generated successfully!")
-    print(f"Saved: {OUTPUT_PATH.name}")
-    if published:
-        print("Published for Download Nowcast Bulletin:")
-        for path in published:
-            print(f"  {path.as_posix()}")
-        print(f"Download URL: {DOWNLOAD_BULLETIN_URL}")
-        if live_download_matches(OUTPUT_PATH):
-            print("Download Nowcast Bulletin is serving this generated bulletin.")
-        else:
-            print(
-                "WARNING: the IP download link is still serving the previous "
-                "server-generated bulletin. Run this script on the IMD Apache "
-                "host (or set IMD_WX_DIR to /var/www/html/tlng/wx) so "
-                "dist_nowcast3.php and IMD_Nowcast_Bulletin.docx land in that folder."
-            )
-    else:
-        print(
-            "WARNING: could not copy the bulletin into the IMD wx folder. "
-            "Set IMD_WX_DIR to /var/www/html/tlng/wx on the Apache server."
-        )
-    return 0
+    return 1
 
 
 if __name__ == "__main__":
