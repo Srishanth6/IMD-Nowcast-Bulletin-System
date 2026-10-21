@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,11 +33,32 @@ from imd_slot_tracker import (
 )
 
 
+_URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_CRED_RE = re.compile(r"\b[^\s:/@]+:[^\s@/]+@")
+_HOST_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b|host='[^']*'|port=\d+|url: \S+")
+
+
+def redact(text) -> str:
+    """Remove URLs, credentials, hosts and IP addresses from a log message."""
+    return _HOST_RE.sub("<host>", _CRED_RE.sub("<cred>@", _URL_RE.sub("<url>", str(text))))
+
+
 def log(handle, message: str) -> None:
     handle.write(message)
     if not message.endswith("\n"):
         handle.write("\n")
     handle.flush()
+
+
+def safe_log(handle, message: str) -> None:
+    """Log without ever raising; error reporting must not crash the runner."""
+    try:
+        log(handle, message)
+    except Exception:
+        try:
+            sys.stderr.write(message + "\n")  # None under pythonw
+        except Exception:
+            pass
 
 
 def acquire_lock():
@@ -88,15 +110,25 @@ def run_generator(handle, slot=None) -> int:
         return 1
     interpreter = PYTHONW if PYTHONW.is_file() else PYTHON
     env = dict(os.environ, IMD_RUN_SLOT=slot_key(slot)) if slot is not None else None
-    completed = subprocess.run(
-        [str(interpreter), "-u", str(GENERATOR)],
-        cwd=str(ROOT),
-        env=env,
-        stdout=handle,
-        stderr=subprocess.STDOUT,
-        creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
-    )
-    return completed.returncode
+    try:
+        completed = subprocess.run(
+            [str(interpreter), "-u", str(GENERATOR)],
+            cwd=str(ROOT),
+            env=env,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+        )
+    except OSError as error:
+        safe_log(handle, f"{now_ist():%Y-%m-%d %H:%M:%S} IST ERROR stage=launch process={interpreter.name}: "
+                         f"{type(error).__name__}: {redact(error)[:160]}")
+        return 1
+    code = completed.returncode
+    if code != 0:
+        detail = f" (terminated by signal {-code})" if code < 0 else ""
+        safe_log(handle, f"{now_ist():%Y-%m-%d %H:%M:%S} IST ERROR stage=generator process={GENERATOR.name} "
+                         f"exit={code}{detail}")
+    return code
 
 
 def generate_for_slot(handle, slot, reason: str) -> int:
@@ -187,13 +219,19 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     with LOG_FILE.open("a", encoding="utf-8", errors="replace") as handle:
         log(handle, f"===== {datetime.now():%Y-%m-%d %H:%M:%S} start =====")
-        if args.simulate:
-            code = run_simulations(handle)
-        elif args.catch_up:
-            code = run_catchup(handle)
-        else:
-            code = run_scheduled(handle)
-        log(handle, f"===== {datetime.now():%Y-%m-%d %H:%M:%S} exit {code} =====")
+        stage = "simulate" if args.simulate else "catch-up" if args.catch_up else "scheduled"
+        try:
+            if args.simulate:
+                code = run_simulations(handle)
+            elif args.catch_up:
+                code = run_catchup(handle)
+            else:
+                code = run_scheduled(handle)
+        except Exception as error:  # pythonw has no console: make runner crashes visible
+            code = 1
+            safe_log(handle, f"{now_ist():%Y-%m-%d %H:%M:%S} IST RUNNER ERROR stage={stage} "
+                             f"{type(error).__name__}: {redact(error)[:160]} exit={code}")
+        safe_log(handle, f"===== {datetime.now():%Y-%m-%d %H:%M:%S} exit {code} =====")
         return code
 
 
