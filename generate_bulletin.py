@@ -87,9 +87,10 @@ def load_cycle_state() -> dict:
     if not CYCLE_STATE_PATH.exists():
         return {}
     try:
-        return json.loads(CYCLE_STATE_PATH.read_text(encoding="utf-8"))
+        data = json.loads(CYCLE_STATE_PATH.read_text(encoding="utf-8"))
     except Exception:
         return {}
+    return data if isinstance(data, dict) else {}
 
 
 def save_cycle_state(state: dict) -> dict:
@@ -107,7 +108,8 @@ def backup_current_outputs() -> dict[Path, bytes | object | None]:
             backup[target] = None
             continue
         try:
-            backup[target] = target.read_bytes()
+            stat = target.stat()
+            backup[target] = (target.read_bytes(), (stat.st_atime_ns, stat.st_mtime_ns))  # bytes kept for exact compare
         except OSError:
             print(f"WARNING: {target.name} is locked; leaving the existing file unchanged")
             backup[target] = SKIP_RESTORE
@@ -124,7 +126,18 @@ def restore_output_backups(backup: dict[Path, bytes | object | None]) -> None:
                 if target.exists():
                     target.unlink()
                 continue
-            tmp_path.write_bytes(payload)
+            data, times = payload if isinstance(payload, tuple) else (payload, None)
+            if times is not None and target.exists():
+                current = target.stat()
+                # Skip only if content is byte-identical AND the mtime is the original;
+                # size/mtime alone can match after a same-size rewrite.
+                if current.st_mtime_ns == times[1] and current.st_size == len(data) \
+                        and hashlib.sha256(target.read_bytes()).digest() == hashlib.sha256(data).digest():
+                    continue  # untouched by this run: no rewrite, no lock risk
+            tmp_path.write_bytes(data)
+            if times is not None:
+                # Keep the original timestamps so a restored file never looks freshly generated.
+                os.utime(tmp_path, ns=times)
             os.replace(os.fspath(tmp_path.resolve()), os.fspath(target.resolve()))
         except OSError:
             print(f"WARNING: could not restore locked file: {target.name}")
@@ -851,6 +864,42 @@ def require_readable_image(path: Path, label: str) -> Path:
     return path
 
 
+_URL_RE = re.compile(r"[a-z][a-z0-9+.-]*://\S+", re.IGNORECASE)
+_HOST_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b|host='[^']*'|port=\d+|url: \S+")
+
+
+def redact(text: str) -> str:
+    """Remove URLs, hosts and IP addresses from a log message."""
+    return _HOST_RE.sub("<host>", _URL_RE.sub("<url>", str(text)))
+
+
+def root_error(error: BaseException) -> BaseException:
+    seen = set()
+    while (error.__cause__ or error.__context__) is not None and id(error) not in seen:
+        seen.add(id(error))
+        error = error.__cause__ or error.__context__
+    return error
+
+
+# Temp files this pipeline may leave behind if a step fails part-way.
+PARTIAL_OUTPUTS = (
+    OUTPUT_PATH.with_name(OUTPUT_PATH.stem + ".tmp.docx"),
+    COMPOSITE_PATH.with_name(COMPOSITE_PATH.stem + ".tmp.png"),
+    ROOT / "latest_warning_map.tmp.png",
+    ROOT / "latest_warning_map.svg.tmp",
+    ROOT / "radar_download" / "radar_images" / "latest_radar.png.tmp",
+)
+
+
+def remove_partial_outputs() -> None:
+    for path in PARTIAL_OUTPUTS:
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError:
+            print(f"WARNING: could not remove partial file: {path.name}")
+
+
 def run_bulletin_cycle():
     started_at = datetime.now(IST)
     print(f"[{started_at.strftime('%H:%M')} IST] Starting bulletin cycle")
@@ -860,11 +909,14 @@ def run_bulletin_cycle():
     previous_radar_hash = previous_state.get("radar_hash")
     previous_radar_time = previous_state.get("radar_timestamp")
     previous_issue = previous_state.get("issue_time")
+    stage = "start"
 
     try:
+        stage = "fetch_page"
         print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Fetching latest IMD data")
         page_html = fetch_nowcast_page()
 
+        stage = "radar"
         try:
             from radar_download.radar_scraper import download_latest_radar
 
@@ -888,6 +940,7 @@ def run_bulletin_cycle():
                 print("Radar source has not published a newer image yet; using the latest available file.")
         print(f"Latest radar saved: {radar_path.as_posix()}")
 
+        stage = "warning_map"
         try:
             from download_warning_map import save_warning_map
 
@@ -897,6 +950,7 @@ def run_bulletin_cycle():
             raise RuntimeError(f"could not download the latest warning map: {error}") from error
         print(f"Latest warning map saved: {Path(map_path).as_posix()}")
 
+        stage = "parse"
         try:
             warning_data = load_imd_warning_content(page_html)
             issued, valid = datetimes_from_imd(warning_data["page_fields"])
@@ -915,6 +969,7 @@ def run_bulletin_cycle():
         print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Generating bulletin")
         print_imd_warning_data(warning_data)
 
+        stage = "build_docx"
         document, png_saved = build_document(radar_path, map_path, warning_data, issued, valid)
         temp_output = OUTPUT_PATH.with_name(OUTPUT_PATH.stem + ".tmp.docx")
         document.save(str(temp_output))
@@ -949,6 +1004,7 @@ def run_bulletin_cycle():
         if not png_saved:
             print(f"WARNING: {COMPOSITE_PATH.name} was not written.")
 
+        stage = "publish"
         published = publish_generated_bulletin(saved_path)
         complete = docx_replaced and png_replaced
         save_cycle_state(
@@ -1003,8 +1059,14 @@ def run_bulletin_cycle():
 
     except Exception as error:
         restore_output_backups(backup)
-        print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Bulletin cycle failed: {error}")
-        return {"status": "failed", "error": str(error)}
+        remove_partial_outputs()
+        print(f"[{datetime.now(IST).strftime('%H:%M')} IST] Bulletin cycle failed: {redact(error)}")
+        cause = root_error(error)
+        print(
+            f"RUN FAILED slot={os.environ.get('IMD_RUN_SLOT', 'manual')} stage={stage} "
+            f"error={type(cause).__name__}: {redact(cause)[:160]}"
+        )
+        return {"status": "failed", "error": redact(error), "stage": stage}
 
 
 def main():

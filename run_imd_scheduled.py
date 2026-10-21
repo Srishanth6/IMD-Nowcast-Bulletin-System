@@ -79,7 +79,7 @@ def archive_outputs(slot) -> None:
             shutil.copy2(source, ARCHIVE_DIR / dest_name)
 
 
-def run_generator(handle) -> int:
+def run_generator(handle, slot=None) -> int:
     if not PYTHON.is_file():
         log(handle, f"ERROR: Python not found: {PYTHON}")
         return 1
@@ -87,9 +87,11 @@ def run_generator(handle) -> int:
         log(handle, f"ERROR: generate_bulletin.py not found: {GENERATOR}")
         return 1
     interpreter = PYTHONW if PYTHONW.is_file() else PYTHON
+    env = dict(os.environ, IMD_RUN_SLOT=slot_key(slot)) if slot is not None else None
     completed = subprocess.run(
         [str(interpreter), "-u", str(GENERATOR)],
         cwd=str(ROOT),
+        env=env,
         stdout=handle,
         stderr=subprocess.STDOUT,
         creationflags=CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
@@ -104,10 +106,14 @@ def generate_for_slot(handle, slot, reason: str) -> int:
         return 0
     try:
         log(handle, f"{reason}: {slot.strftime('%H:%M')}")
-        code = run_generator(handle)
+        code = run_generator(handle, slot)
         if code == 0:
-            mark_slot_completed(slot)
-            archive_outputs(slot)
+            if not mark_slot_completed(slot):
+                log(handle, f"WARNING: could not record slot {slot_key(slot)} in the slot file; it may be retried")
+            try:
+                archive_outputs(slot)
+            except OSError as error:
+                log(handle, f"WARNING: could not archive outputs: {type(error).__name__}")
             log(handle, f"Completed slot: {slot_key(slot)}")
         else:
             log(handle, f"Generation failed for slot {slot_key(slot)} with exit {code}")
@@ -134,13 +140,15 @@ def run_catchup(handle) -> int:
         log(handle, "No missed slot")
         log(handle, f"Next scheduled slot: {nxt.strftime('%H:%M')}")
         return 0
-    worst = 0
-    for slot in pending:
-        log(handle, f"Missed slot detected: {slot.strftime('%H:%M')}")
-        code = generate_for_slot(handle, slot, "Generating missed bulletin")
-        if code != 0:
-            worst = code
-            break
+    # One bounded attempt per run, for the most recent missed slot only. Older
+    # missed slots would be regenerated from the same live data, so they are
+    # superseded once the latest slot succeeds. A failed slot stays unmarked
+    # and is retried by the next scheduled or catch-up run.
+    if len(pending) > 1:
+        log(handle, f"Missed slots: {len(pending)}; attempting latest only")
+    slot = pending[-1]
+    log(handle, f"Missed slot detected: {slot.strftime('%H:%M')}")
+    worst = generate_for_slot(handle, slot, "Generating missed bulletin")
     log(handle, f"Next scheduled slot: {nxt.strftime('%H:%M')}")
     return worst
 
